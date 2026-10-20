@@ -1,3 +1,4 @@
+use crate::assistant::{self, AssistantChat, AssistantMessage, CardBatch, PendingCards};
 use crate::commands::AppState;
 use crate::config;
 use crate::history::{self, InterviewRecord};
@@ -148,6 +149,7 @@ pub struct AiRuntime {
     stream_abort: Option<Arc<AtomicBool>>,
     stream_task: Option<tauri::async_runtime::JoinHandle<()>>,
     sessions: HashMap<String, SessionContext>,
+    assistant_sessions: HashMap<String, String>,
 }
 
 impl Default for AiRuntime {
@@ -158,6 +160,7 @@ impl Default for AiRuntime {
             stream_abort: None,
             stream_task: None,
             sessions: HashMap::new(),
+            assistant_sessions: HashMap::new(),
         }
     }
 }
@@ -175,6 +178,7 @@ impl AiRuntime {
         }
         self.port = None;
         self.sessions.clear();
+        self.assistant_sessions.clear();
     }
 }
 
@@ -1030,11 +1034,18 @@ fn normalize_key(text: &str) -> String {
         .collect()
 }
 
+struct CommitOutcome {
+    created: usize,
+    skipped: usize,
+    note_ids: Vec<String>,
+    created_cards: Vec<AiCardProposal>,
+}
+
 fn commit_cards_to_vault(
     vault: &mut crate::vault::Vault,
     deck_id: &str,
     cards: Vec<AiCardProposal>,
-) -> Result<(usize, usize), String> {
+) -> Result<CommitOutcome, String> {
     let mut existing: Vec<String> = vault
         .list_notes(deck_id, "")?
         .into_iter()
@@ -1043,6 +1054,8 @@ fn commit_cards_to_vault(
         .collect();
     let mut created = 0usize;
     let mut skipped = 0usize;
+    let mut note_ids = Vec::new();
+    let mut created_cards = Vec::new();
     for card in sanitize_cards(cards) {
         let key = normalize_key(&card.front);
         if key.is_empty() || existing.iter().any(|value| value == &key) {
@@ -1052,17 +1065,24 @@ fn commit_cards_to_vault(
         let mut fields = HashMap::new();
         fields.insert("front".to_string(), card.front.clone());
         fields.insert("back".to_string(), card.back.clone());
-        vault.save_note(SaveNoteInput {
+        let note = vault.save_note(SaveNoteInput {
             deck_id: deck_id.to_string(),
             note_id: None,
             note_type: "basic".to_string(),
             tags: card.tags.clone(),
             fields,
         })?;
+        note_ids.push(note.id);
+        created_cards.push(card.clone());
         existing.push(key);
         created += 1;
     }
-    Ok((created, skipped))
+    Ok(CommitOutcome {
+        created,
+        skipped,
+        note_ids,
+        created_cards,
+    })
 }
 
 async fn get_context(
@@ -1338,7 +1358,7 @@ pub async fn ai_interview_commit(
     cards: Vec<AiCardProposal>,
 ) -> Result<CommitResult, String> {
     let mut record = history::load(&app, &interview_id)?;
-    let (created, skipped) = {
+    let outcome = {
         let mut guard = state
             .vault
             .lock()
@@ -1348,15 +1368,15 @@ pub async fn ai_interview_commit(
             .ok_or_else(|| "Хранилище не открыто".to_string())?;
         commit_cards_to_vault(vault, &deck_id, cards)?
     };
-    record.cards_created += created;
+    record.cards_created += outcome.created;
     record.updated_at = now_ms();
-    if created > 0 {
+    if outcome.created > 0 {
         record.status = "done".to_string();
     }
     history::save(&app, &record)?;
     Ok(CommitResult {
-        created,
-        skipped,
+        created: outcome.created,
+        skipped: outcome.skipped,
         deck_id,
     })
 }
@@ -1493,7 +1513,7 @@ pub async fn ai_assistant_commit(
     cards: Vec<AiCardProposal>,
 ) -> Result<CommitResult, String> {
     let _ = app;
-    let (created, skipped) = {
+    let outcome = {
         let mut guard = state
             .vault
             .lock()
@@ -1504,8 +1524,8 @@ pub async fn ai_assistant_commit(
         commit_cards_to_vault(vault, &deck_id, cards)?
     };
     Ok(CommitResult {
-        created,
-        skipped,
+        created: outcome.created,
+        skipped: outcome.skipped,
         deck_id,
     })
 }
@@ -1678,3 +1698,851 @@ pub async fn ai_stop(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
     Ok(())
 }
 
+
+
+
+
+
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantChatResult {
+    pub chat: AssistantChat,
+    pub session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantTurnResult {
+    pub chat: AssistantChat,
+    pub session_id: String,
+    pub reply: String,
+}
+
+struct DeckTurnContext {
+    id: String,
+    name: String,
+    description: String,
+    notes: Vec<(String, String, String, Vec<String>)>,
+}
+
+fn deck_turn_context(
+    vault: &crate::vault::Vault,
+    deck_id: &str,
+) -> Result<Option<DeckTurnContext>, String> {
+    let info = vault.info()?;
+    let Some(deck) = info.decks.into_iter().find(|deck| deck.id == deck_id) else {
+        return Ok(None);
+    };
+    let notes = vault
+        .list_notes(deck_id, "")?
+        .into_iter()
+        .take(60)
+        .map(|note| {
+            let back = vault
+                .get_note(deck_id, &note.id)
+                .ok()
+                .and_then(|detail| detail.fields.get("back").cloned())
+                .unwrap_or_default();
+            (note.id, shorten(&note.preview, 160), shorten(&back, 260), note.tags)
+        })
+        .collect();
+    Ok(Some(DeckTurnContext {
+        id: deck.id,
+        name: deck.name,
+        description: shorten(&deck.description, 200),
+        notes,
+    }))
+}
+
+fn vault_map(vault: &crate::vault::Vault) -> Result<String, String> {
+    let info = vault.info()?;
+    let mut lines = Vec::new();
+    for deck in info.decks {
+        lines.push(format!(
+            "- id: {} | {} | {} | карточек: {}",
+            deck.id,
+            deck.name,
+            shorten(&deck.description, 90),
+            deck.counts.total
+        ));
+    }
+    if lines.is_empty() {
+        Ok("(колод пока нет)".to_string())
+    } else {
+        Ok(lines.join("\n"))
+    }
+}
+
+fn assistant_system(
+    vault: &crate::vault::Vault,
+    deck: Option<&DeckTurnContext>,
+) -> Result<String, String> {
+    let map = vault_map(vault)?;
+    let deck_block = if let Some(deck) = deck {
+        let notes = if deck.notes.is_empty() {
+            "(в колоде пока нет карточек)".to_string()
+        } else {
+            deck.notes
+                .iter()
+                .map(|(id, front, back, tags)| {
+                    format!(
+                        "- noteId: {} | В: {} | О: {} | теги: {}",
+                        id,
+                        front,
+                        back,
+                        if tags.is_empty() {
+                            "—".to_string()
+                        } else {
+                            tags.join(", ")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "Сейчас открыта колода: {} (id: {}).\n{}\nСуществующие карточки текущей колоды:\n{}",
+            deck.name, deck.id, deck.description, notes
+        )
+    } else {
+        "Текущая колода не выбрана. Если пользователь просит создать карточки и непонятно, куда их положить, не указывай deckId — приложение спросит пользователя.".to_string()
+    };
+
+    Ok(format!(
+        "Ты — ИИ-ассистент Cardz. Общайся живо и по-человечески, помогай с карточками для интервального повторения.\n\
+Ты умеешь создавать и редактировать карточки сам, без предварительного предпросмотра. Не спрашивай разрешения, если задача понятна.\n\
+Правила карточек: одна карточка — одна мысль; front — конкретный вопрос; back — короткий ответ, при пользе с примером; tags — 1–3. Пиши на языке пользователя.\n\
+Не дублируй существующие карточки. Если пользователь просит просто объяснить или обсудить — не создавай карточки.\n\n\
+Список колод:\n{}\n\n{}\n\n\
+ПРОТОКОЛ ДЕЙСТВИЙ.\n\
+Если нужно создать карточки, после обычного текста ответа добавь блок:\n\
+<<<CARDZ_ACTIONS>>>\n\
+{{\"actions\":[{{\"type\":\"create_cards\",\"deckId\":\"точный id или null\",\"deckName\":\"название или null\",\"cards\":[{{\"front\":\"вопрос\",\"back\":\"ответ\",\"tags\":[\"тег\"],\"topic\":\"подтема\"}}]}}]}}\n\
+<<<END_CARDZ_ACTIONS>>>\n\
+Если нужно изменить существующие карточки, используй:\n\
+<<<CARDZ_ACTIONS>>>\n\
+{{\"actions\":[{{\"type\":\"edit_cards\",\"deckId\":\"id колоды\",\"cards\":[{{\"noteId\":\"id из списка\",\"front\":\"новый вопрос или null\",\"back\":\"новый ответ или null\",\"tags\":[\"теги\"]}}]}}]}}\n\
+<<<END_CARDZ_ACTIONS>>>\n\
+Правила действий:\n\
+- deckId бери только из списка колод. Если не уверен, куда класть карточки, не указывай deckId и deckName — приложение откроет выбор колоды.\n\
+- Для редактирования обязательно используй noteId из списка существующих карточек текущей колоды.\n\
+- Не показывай служебный блок в обычном тексте и не упоминай JSON.\n\
+- Если пользователь указал колоду по названию, найди её id в списке.\n\
+- Можно создавать несколько карточек за один раз.",
+        map, deck_block
+    ))
+}
+
+fn resolve_deck_target(
+    vault: &crate::vault::Vault,
+    deck_id: Option<&str>,
+    deck_name: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    let info = vault.info()?;
+    if let Some(id) = deck_id {
+        if let Some(deck) = info.decks.iter().find(|deck| deck.id == id) {
+            return Ok(Some((deck.id.clone(), deck.name.clone())));
+        }
+    }
+    if let Some(name) = deck_name {
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let exact: Vec<_> = info
+            .decks
+            .iter()
+            .filter(|deck| {
+                deck.name.to_lowercase() == needle || deck.id.to_lowercase() == needle
+            })
+            .collect();
+        if exact.len() == 1 {
+            return Ok(Some((exact[0].id.clone(), exact[0].name.clone())));
+        }
+        let fuzzy: Vec<_> = info
+            .decks
+            .iter()
+            .filter(|deck| {
+                let deck_name = deck.name.to_lowercase();
+                deck_name.contains(&needle) || needle.contains(&deck_name)
+            })
+            .collect();
+        if fuzzy.len() == 1 {
+            return Ok(Some((fuzzy[0].id.clone(), fuzzy[0].name.clone())));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_assistant_actions(raw: &str) -> (String, Vec<Value>) {
+    const START: &str = "<<<CARDZ_ACTIONS>>>";
+    const END: &str = "<<<END_CARDZ_ACTIONS>>>";
+    let Some(start) = raw.find(START) else {
+        return (raw.trim().to_string(), Vec::new());
+    };
+    let after_start = start + START.len();
+    let end = raw[after_start..]
+        .find(END)
+        .map(|offset| after_start + offset)
+        .unwrap_or(raw.len());
+    let json_part = &raw[after_start..end];
+    let visible = format!(
+        "{}{}",
+        &raw[..start],
+        if end + END.len() <= raw.len() {
+            &raw[end + END.len()..]
+        } else {
+            ""
+        }
+    )
+    .trim()
+    .trim_end_matches("```json")
+    .trim_end_matches("```")
+    .trim()
+    .to_string();
+    let actions = extract_json(json_part)
+        .and_then(|value| {
+            if let Some(array) = value.as_array() {
+                Some(array.clone())
+            } else {
+                value
+                    .get("actions")
+                    .and_then(|actions| actions.as_array().cloned())
+            }
+        })
+        .unwrap_or_default();
+    (visible, actions)
+}
+
+fn looks_like_card_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("карточ") || lower.contains("card"))
+        && ["создай", "сделай", "добавь", "сгенерируй", "сформируй"]
+            .iter()
+            .any(|word| lower.contains(word))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditCardAction {
+    #[serde(default, alias = "note_id")]
+    note_id: Option<String>,
+    #[serde(default)]
+    find: Option<String>,
+    #[serde(default)]
+    front: Option<String>,
+    #[serde(default)]
+    back: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+fn apply_edit_action(
+    vault: &mut crate::vault::Vault,
+    deck_id: &str,
+    values: &[Value],
+) -> Result<(usize, Vec<String>), String> {
+    let mut updated = 0usize;
+    let mut errors = Vec::new();
+    for value in values {
+        let Ok(edit) = serde_json::from_value::<EditCardAction>(value.clone()) else {
+            errors.push("не удалось разобрать правку".to_string());
+            continue;
+        };
+        let mut note_id = edit.note_id.clone();
+        if note_id.is_none() {
+            if let Some(find) = edit.find.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                let matches = vault.list_notes(deck_id, find)?;
+                if matches.len() == 1 {
+                    note_id = Some(matches[0].id.clone());
+                }
+            }
+        }
+        let Some(note_id) = note_id else {
+            errors.push("не нашёл карточку для правки".to_string());
+            continue;
+        };
+        let detail = match vault.get_note(deck_id, &note_id) {
+            Ok(detail) => detail,
+            Err(_) => {
+                errors.push(format!("карточка {} не найдена", note_id));
+                continue;
+            }
+        };
+        let mut fields = detail.fields.clone();
+        if let Some(front) = edit.front.filter(|front| !front.trim().is_empty()) {
+            fields.insert("front".to_string(), front);
+        }
+        if let Some(back) = edit.back.filter(|back| !back.trim().is_empty()) {
+            fields.insert("back".to_string(), back);
+        }
+        let tags = edit.tags.unwrap_or(detail.tags);
+        vault.save_note(SaveNoteInput {
+            deck_id: deck_id.to_string(),
+            note_id: Some(note_id),
+            note_type: detail.note_type,
+            tags,
+            fields,
+        })?;
+        updated += 1;
+    }
+    Ok((updated, errors))
+}
+
+fn run_assistant_actions(
+    vault: &mut crate::vault::Vault,
+    chat: &mut AssistantChat,
+    actions: &[Value],
+    current_deck_id: Option<&str>,
+) -> Result<(Option<PendingCards>, Vec<String>), String> {
+    let mut pending: Option<PendingCards> = None;
+    let mut summary = Vec::new();
+    for action in actions {
+        let kind = action
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        let deck_id = action
+            .get("deckId")
+            .or_else(|| action.get("deck_id"))
+            .and_then(|id| id.as_str());
+        let deck_name = action
+            .get("deckName")
+            .or_else(|| action.get("deck_name"))
+            .and_then(|name| name.as_str());
+        match kind {
+            "create_cards" | "createCards" | "create" => {
+                let cards: Vec<AiCardProposal> = action
+                    .get("cards")
+                    .and_then(|cards| cards.as_array())
+                    .map(|cards| {
+                        cards
+                            .iter()
+                            .filter_map(|card| {
+                                serde_json::from_value::<AiCardProposal>(card.clone()).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cards = sanitize_cards(cards);
+                if cards.is_empty() {
+                    continue;
+                }
+                let mut target = resolve_deck_target(vault, deck_id, deck_name)?;
+                if target.is_none() && deck_id.is_none() && deck_name.is_none() {
+                    if let Some(current) = current_deck_id {
+                        target = resolve_deck_target(vault, Some(current), None)?;
+                    }
+                }
+                let Some((target_id, target_name)) = target else {
+                    if let Some(existing) = pending.as_mut() {
+                        existing.cards.extend(cards);
+                    } else {
+                        pending = Some(PendingCards {
+                            id: ulid::Ulid::generate().to_string(),
+                            cards,
+                            suggested_deck_id: current_deck_id.map(str::to_string),
+                            question: "Куда добавить эти карточки?".to_string(),
+                        });
+                    }
+                    continue;
+                };
+                let outcome = commit_cards_to_vault(vault, &target_id, cards)?;
+                let at = now_ms();
+                if outcome.created > 0 {
+                    let batch = CardBatch {
+                        id: ulid::Ulid::generate().to_string(),
+                        deck_id: target_id.clone(),
+                        deck_name: target_name.clone(),
+                        note_ids: outcome.note_ids.clone(),
+                        cards: outcome.created_cards.clone(),
+                        created_at: at,
+                        undone: false,
+                    };
+                    chat.messages.push(AssistantMessage {
+                        role: "system".to_string(),
+                        content: format!(
+                            "Добавлено карточек: {} в «{}»{}.",
+
+                            outcome.created,
+                            target_name,
+                            if outcome.skipped > 0 {
+                                format!(", пропущено дублей: {}", outcome.skipped)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        at,
+                        batch: Some(batch),
+                    });
+                    summary.push(format!(
+                        "Создано {} карточек в «{}», пропущено {}.",
+                        outcome.created, target_name, outcome.skipped
+                    ));
+                } else {
+                    chat.messages.push(AssistantMessage {
+                        role: "system".to_string(),
+                        content: format!("Все карточки уже есть в «{}».", target_name),
+                        at,
+                        batch: None,
+                    });
+                    summary.push(format!("Все карточки уже есть в «{}».", target_name));
+                }
+            }
+            "edit_cards" | "editCards" | "edit" => {
+                let values: Vec<Value> = action
+                    .get("cards")
+                    .and_then(|cards| cards.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut target = resolve_deck_target(vault, deck_id, deck_name)?;
+                if target.is_none() && deck_id.is_none() && deck_name.is_none() {
+                    if let Some(current) = current_deck_id {
+                        target = resolve_deck_target(vault, Some(current), None)?;
+                    }
+                }
+                let Some((target_id, target_name)) = target else {
+                    summary.push("Не понял, в какой колоде править карточки.".to_string());
+                    continue;
+                };
+                let (updated, errors) = apply_edit_action(vault, &target_id, &values)?;
+                let at = now_ms();
+                chat.messages.push(AssistantMessage {
+                    role: "system".to_string(),
+                    content: if errors.is_empty() {
+                        format!("Обновлено карточек: {} в «{}».", updated, target_name)
+                    } else {
+                        format!(
+                            "Обновлено карточек: {} в «{}». Не удалось: {}.",
+                            updated,
+                            target_name,
+                            errors.join("; ")
+                        )
+                    },
+                    at,
+                    batch: None,
+                });
+                summary.push(format!(
+                    "Отредактировано {} карточек в «{}».",
+                    updated, target_name
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok((pending, summary))
+}
+
+async fn ensure_assistant_session(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    chat: &mut AssistantChat,
+) -> Result<(String, reqwest::Client, u16), String> {
+    let (client, port) = ensure_server(app, state).await?;
+    if let Some(session_id) = chat.opencode_session_id.clone() {
+        let url = format!("http://127.0.0.1:{}/session/{}", port, session_id);
+        let exists = client
+            .get(url)
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        if exists {
+            state
+                .ai
+                .lock()
+                .await
+                .assistant_sessions
+                .insert(session_id.clone(), chat.id.clone());
+            return Ok((session_id, client, port));
+        }
+    }
+    let session_id = create_session(&client, port, "Cardz AI").await?;
+    let transcript = chat
+        .messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .rev()
+        .take(30)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "{}: {}",
+                if message.role == "assistant" {
+                    "Ассистент"
+                } else {
+                    "Пользователь"
+                },
+                shorten(&message.content, 1200)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !transcript.trim().is_empty() {
+        inject_context(
+            &client,
+            port,
+            &session_id,
+            &format!(
+                "[СЛУЖЕБНЫЙ КОНТЕКСТ: предыдущий чат. Продолжи с того места, где остановились.]\n{}",
+                transcript
+            ),
+        )
+        .await?;
+    }
+    chat.opencode_session_id = Some(session_id.clone());
+    assistant::save(app, chat)?;
+    state
+        .ai
+        .lock()
+        .await
+        .assistant_sessions
+        .insert(session_id.clone(), chat.id.clone());
+    Ok((session_id, client, port))
+}
+
+#[tauri::command]
+pub fn ai_assistant_chat_load(app: AppHandle) -> Result<Option<AssistantChat>, String> {
+    assistant::load(&app)
+}
+
+#[tauri::command]
+pub async fn ai_assistant_chat_new(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AssistantChat, String> {
+    let chat = assistant::new_chat();
+    assistant::save(&app, &chat)?;
+    state.ai.lock().await.assistant_sessions.clear();
+    Ok(chat)
+}
+
+#[tauri::command]
+pub async fn ai_assistant_chat_prepare(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AssistantChatResult, String> {
+    let mut chat = assistant::load_or_new(&app)?;
+    let (session_id, _, _) = ensure_assistant_session(&app, &state, &mut chat).await?;
+    Ok(AssistantChatResult {
+        chat,
+        session_id: Some(session_id),
+    })
+}
+
+#[tauri::command]
+pub async fn ai_assistant_chat_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message: String,
+    current_deck_id: Option<String>,
+) -> Result<AssistantTurnResult, String> {
+    let text = message.trim().to_string();
+    if text.is_empty() {
+        return Err("Сообщение не может быть пустым".to_string());
+    }
+    let mut chat = assistant::load_or_new(&app)?;
+    let (session_id, client, port) = ensure_assistant_session(&app, &state, &mut chat).await?;
+    let at = now_ms();
+    chat.messages.push(AssistantMessage {
+        role: "user".to_string(),
+        content: text.clone(),
+        at,
+        batch: None,
+    });
+    chat.updated_at = at;
+    assistant::save(&app, &chat)?;
+    let settings = config::read_config(&app).ai;
+
+    let (system, deck_context) = {
+        let guard = state
+            .vault
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+        let vault = guard
+            .as_ref()
+            .ok_or_else(|| "Хранилище не открыто".to_string())?;
+        let mut candidate = current_deck_id.clone();
+        if candidate.is_none() {
+            candidate = chat.last_deck_id.clone();
+        }
+        let context = candidate
+            .as_deref()
+            .map(|deck_id| deck_turn_context(vault, deck_id))
+            .transpose()?
+            .flatten();
+        let system = assistant_system(vault, context.as_ref())?;
+        (system, context)
+    };
+    if let Some(context) = &deck_context {
+        chat.last_deck_id = Some(context.id.clone());
+    }
+    assistant::save(&app, &chat)?;
+
+    let raw = prompt_plain(
+        &client,
+        port,
+        &session_id,
+        &settings.model,
+        &system,
+        &text,
+    )
+    .await?;
+    let (visible, actions) = parse_assistant_actions(&raw);
+    let empty_reply = visible.trim().is_empty();
+    let reply = if visible.trim().is_empty() {
+        "Готово.".to_string()
+    } else {
+        visible
+    };
+    let at = now_ms();
+    chat.messages.push(AssistantMessage {
+        role: "assistant".to_string(),
+        content: reply.clone(),
+        at,
+        batch: None,
+    });
+    chat.updated_at = at;
+    assistant::save(&app, &chat)?;
+
+    let (pending, mut summary) = {
+        let mut guard = state
+            .vault
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+        let vault = guard
+            .as_mut()
+            .ok_or_else(|| "Хранилище не открыто".to_string())?;
+        run_assistant_actions(
+            vault,
+            &mut chat,
+            &actions,
+            deck_context.as_ref().map(|context| context.id.as_str()),
+        )?
+    };
+
+    if actions.is_empty() && pending.is_none() && empty_reply && looks_like_card_request(&text) {
+        if let Some(context) = &deck_context {
+            let fallback_prompt = format!(
+                "Пользователь просит: {}\n\nСоздай 1–12 атомарных карточек. Верни JSON по схеме.",
+                text
+            );
+            if let Ok(output) = prompt_structured::<CardsOutput>(
+                &client,
+                port,
+                &session_id,
+                &settings.model,
+                &system,
+                &fallback_prompt,
+                cards_schema(),
+            )
+            .await
+            {
+                let cards = sanitize_cards(output.cards);
+                if !cards.is_empty() {
+                    let mut guard = state
+                        .vault
+                        .lock()
+                        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+                    let vault = guard
+                        .as_mut()
+                        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+                    let outcome = commit_cards_to_vault(vault, &context.id, cards)?;
+                    if outcome.created > 0 {
+                        let batch = CardBatch {
+                            id: ulid::Ulid::generate().to_string(),
+                            deck_id: context.id.clone(),
+                            deck_name: context.name.clone(),
+                            note_ids: outcome.note_ids.clone(),
+                            cards: outcome.created_cards.clone(),
+                            created_at: now_ms(),
+                            undone: false,
+                        };
+                        chat.messages.push(AssistantMessage {
+                            role: "system".to_string(),
+                            content: format!(
+                                "Добавлено карточек: {} в «{}».",
+                                outcome.created, context.name
+                            ),
+                            at: now_ms(),
+                            batch: Some(batch),
+                        });
+                        summary.push(format!(
+                            "Создано {} карточек в «{}».",
+                            outcome.created, context.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    chat.pending = pending;
+    chat.updated_at = now_ms();
+    assistant::save(&app, &chat)?;
+
+    if !summary.is_empty() {
+        let _ = inject_context(
+            &client,
+            port,
+            &session_id,
+            &format!("[Результат действий]\n{}", summary.join("\n")),
+        )
+        .await;
+    }
+
+    Ok(AssistantTurnResult {
+        chat,
+        session_id,
+        reply,
+    })
+}
+
+#[tauri::command]
+pub async fn ai_assistant_chat_confirm(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    deck_id: String,
+) -> Result<AssistantChat, String> {
+    let mut chat = assistant::load_or_new(&app)?;
+    let Some(pending) = chat.pending.clone() else {
+        return Err("Нет карточек, ожидающих выбора колоды".to_string());
+    };
+    let (deck_name, outcome) = {
+        let mut guard = state
+            .vault
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+        let vault = guard
+            .as_mut()
+            .ok_or_else(|| "Хранилище не открыто".to_string())?;
+        let info = vault.info()?;
+        let Some(deck) = info.decks.into_iter().find(|deck| deck.id == deck_id) else {
+            return Err("Колода не найдена".to_string());
+        };
+        let outcome = commit_cards_to_vault(vault, &deck_id, pending.cards.clone())?;
+        (deck.name, outcome)
+    };
+    chat.pending = None;
+    if outcome.created > 0 {
+        let batch = CardBatch {
+            id: ulid::Ulid::generate().to_string(),
+            deck_id: deck_id.clone(),
+            deck_name: deck_name.clone(),
+            note_ids: outcome.note_ids.clone(),
+            cards: outcome.created_cards.clone(),
+            created_at: now_ms(),
+            undone: false,
+        };
+        chat.messages.push(AssistantMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Добавлено карточек: {} в «{}»{}.",
+                outcome.created,
+                deck_name,
+                if outcome.skipped > 0 {
+                    format!(", пропущено дублей: {}", outcome.skipped)
+                } else {
+                    String::new()
+                }
+            ),
+            at: now_ms(),
+            batch: Some(batch),
+        });
+    } else {
+        chat.messages.push(AssistantMessage {
+            role: "system".to_string(),
+            content: format!("Все карточки уже есть в «{}».", deck_name),
+            at: now_ms(),
+            batch: None,
+        });
+    }
+    chat.updated_at = now_ms();
+    assistant::save(&app, &chat)?;
+    if let Some(session_id) = chat.opencode_session_id.clone() {
+        if let Ok((client, port)) = ensure_server(&app, &state).await {
+            let _ = inject_context(
+                &client,
+                port,
+                &session_id,
+                &format!(
+                    "[Результат действий] Создано {} карточек в «{}».",
+                    outcome.created, deck_name
+                ),
+            )
+            .await;
+        }
+    }
+    Ok(chat)
+}
+
+#[tauri::command]
+pub fn ai_assistant_chat_cancel_pending(app: AppHandle) -> Result<AssistantChat, String> {
+    let mut chat = assistant::load_or_new(&app)?;
+    chat.pending = None;
+    chat.updated_at = now_ms();
+    assistant::save(&app, &chat)?;
+    Ok(chat)
+}
+
+#[tauri::command]
+pub async fn ai_assistant_chat_undo(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    batch_id: String,
+) -> Result<AssistantChat, String> {
+    let mut chat = assistant::load_or_new(&app)?;
+    let Some((deck_id, note_ids)) = chat.messages.iter().find_map(|message| {
+        message.batch.as_ref().and_then(|batch| {
+            if batch.id == batch_id {
+                Some((batch.deck_id.clone(), batch.note_ids.clone()))
+            } else {
+                None
+            }
+        })
+    }) else {
+        return Err("Создание не найдено".to_string());
+    };
+    {
+        let mut guard = state
+            .vault
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+        let vault = guard
+            .as_mut()
+            .ok_or_else(|| "Хранилище не открыто".to_string())?;
+        for note_id in &note_ids {
+            let _ = vault.delete_note(&deck_id, note_id);
+        }
+    }
+    for message in &mut chat.messages {
+        if let Some(batch) = message.batch.as_mut() {
+            if batch.id == batch_id {
+                batch.undone = true;
+            }
+        }
+    }
+    chat.messages.push(AssistantMessage {
+        role: "system".to_string(),
+        content: "Создание карточек отменено.".to_string(),
+        at: now_ms(),
+        batch: None,
+    });
+    chat.updated_at = now_ms();
+    assistant::save(&app, &chat)?;
+    if let Some(session_id) = chat.opencode_session_id.clone() {
+        if let Ok((client, port)) = ensure_server(&app, &state).await {
+            let _ = inject_context(
+                &client,
+                port,
+                &session_id,
+                "[Результат действий] Пользователь отменил создание карточек.",
+            )
+            .await;
+        }
+    }
+    Ok(chat)
+}

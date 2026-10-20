@@ -9,7 +9,7 @@ import { Review } from "./components/Review";
 import { SyncPanel } from "./components/SyncPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Interview } from "./components/Interview";
-import { AssistantPanel } from "./components/AssistantPanel";
+import { AssistantDock } from "./components/AssistantDock";
 import { api } from "./lib/api";
 import type {
   Deck,
@@ -32,8 +32,8 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [syncOpen, setSyncOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [assistantOpen, setAssistantOpen] = useState(false);
-  const [assistantDeckId, setAssistantDeckId] = useState<string | null>(null);
+  const [assistantOpened, setAssistantOpened] = useState(false);
+  const [assistantExpand, setAssistantExpand] = useState(0);
   const [interview, setInterview] = useState<
     | { kind: "new"; scope: ReviewScope; title: string }
     | { kind: "history"; id: string }
@@ -366,8 +366,8 @@ export default function App() {
         onOpenSync={() => setSyncOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenAssistant={() => {
-          setAssistantDeckId(selection?.kind === "deck" ? selection.id : null);
-          setAssistantOpen(true);
+          setAssistantOpened(true);
+          setAssistantExpand((value) => value + 1);
         }}
       />
 
@@ -478,16 +478,16 @@ export default function App() {
         />
       )}
 
-      {assistantOpen && (
-        <AssistantPanel
+      {assistantOpened && (
+        <AssistantDock
           vault={vault}
-          initialDeckId={assistantDeckId}
-          onClose={() => setAssistantOpen(false)}
+          currentDeckId={selection?.kind === "deck" ? selection.id : null}
+          expandSignal={assistantExpand}
           onChanged={() => {
             void refresh();
             setVersion((value) => value + 1);
           }}
-          onStartReview={startReview}
+          onOpenSettings={() => setSettingsOpen(true)}
         />
       )}
     </div>

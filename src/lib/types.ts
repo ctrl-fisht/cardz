@@ -243,3 +243,48 @@ export type AiEvent = {
 };
 
 export type StartInterview = (scope: ReviewScope, title: string) => void;
+
+export type CardBatch = {
+  id: string;
+  deckId: string;
+  deckName: string;
+  noteIds: string[];
+  cards: AiCardProposal[];
+  createdAt: number;
+  undone?: boolean;
+};
+
+export type AssistantMessage = {
+  role: "user" | "assistant" | "system";
+  content: string;
+  at: number;
+  batch?: CardBatch | null;
+};
+
+export type PendingCards = {
+  id: string;
+  cards: AiCardProposal[];
+  suggestedDeckId?: string | null;
+  question: string;
+};
+
+export type AssistantChat = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  opencodeSessionId: string | null;
+  lastDeckId: string | null;
+  messages: AssistantMessage[];
+  pending: PendingCards | null;
+};
+
+export type AssistantChatResult = {
+  chat: AssistantChat;
+  sessionId: string | null;
+};
+
+export type AssistantTurnResult = {
+  chat: AssistantChat;
+  sessionId: string;
+  reply: string;
+};

@@ -1,4 +1,5 @@
 mod ai;
+mod assistant;
 mod commands;
 mod config;
 mod db;
@@ -73,6 +74,13 @@ pub fn run() {
             ai::ai_interview_commit,
             ai::ai_assistant_generate,
             ai::ai_assistant_commit,
+            ai::ai_assistant_chat_load,
+            ai::ai_assistant_chat_new,
+            ai::ai_assistant_chat_prepare,
+            ai::ai_assistant_chat_send,
+            ai::ai_assistant_chat_confirm,
+            ai::ai_assistant_chat_cancel_pending,
+            ai::ai_assistant_chat_undo,
             ai::ai_interview_abort,
             ai::ai_interview_resume,
             ai::ai_history_list,

@@ -4,6 +4,9 @@ import type {
   AiSettings,
   AiStatus,
   AnswerResult,
+  AssistantChat,
+  AssistantChatResult,
+  AssistantTurnResult,
   CommitResult,
   CreateDeckResult,
   CreateGroupResult,
@@ -115,6 +118,22 @@ export const api = {
     }),
   aiAssistantCommit: (deckId: string, cards: AiCardProposal[]) =>
     invoke<CommitResult>("ai_assistant_commit", { deckId, cards }),
+  aiAssistantChatLoad: () =>
+    invoke<AssistantChat | null>("ai_assistant_chat_load"),
+  aiAssistantChatNew: () => invoke<AssistantChat>("ai_assistant_chat_new"),
+  aiAssistantChatPrepare: () =>
+    invoke<AssistantChatResult>("ai_assistant_chat_prepare"),
+  aiAssistantChatSend: (message: string, currentDeckId?: string | null) =>
+    invoke<AssistantTurnResult>("ai_assistant_chat_send", {
+      message,
+      currentDeckId: currentDeckId ?? null,
+    }),
+  aiAssistantChatConfirm: (deckId: string) =>
+    invoke<AssistantChat>("ai_assistant_chat_confirm", { deckId }),
+  aiAssistantChatCancelPending: () =>
+    invoke<AssistantChat>("ai_assistant_chat_cancel_pending"),
+  aiAssistantChatUndo: (batchId: string) =>
+    invoke<AssistantChat>("ai_assistant_chat_undo", { batchId }),
   aiInterviewAbort: (sessionId: string) =>
     invoke<void>("ai_interview_abort", { sessionId }),
   aiInterviewResume: (interviewId: string) =>
