@@ -4,9 +4,16 @@ import {
   FolderTree,
   Infinity as InfinityIcon,
   Play,
+  Sparkles,
   Trash2,
 } from "lucide-react";
-import type { Counts, Deck, Group, StartReview } from "../lib/types";
+import type {
+  Counts,
+  Deck,
+  Group,
+  StartInterview,
+  StartReview,
+} from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 function prettySegment(segment: string): string {
@@ -46,12 +53,14 @@ export function GroupView({
   decks,
   onSelectDeck,
   onStartReview,
+  onStartInterview,
   onDeleteGroup,
 }: {
   group: Group;
   decks: Deck[];
   onSelectDeck: (id: string) => void;
   onStartReview: StartReview;
+  onStartInterview: StartInterview;
   onDeleteGroup: (groupId: string) => Promise<void>;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -101,6 +110,20 @@ export function GroupView({
               {counts.total > 0 && (
                 <span className="btn-count">{counts.total}</span>
               )}
+            </button>
+            <button
+              className="ghost-btn"
+              disabled={counts.total === 0}
+              onClick={() =>
+                onStartInterview({ kind: "group", id: group.id }, group.name)
+              }
+              title={
+                counts.total === 0
+                  ? "Сначала добавьте карточки"
+                  : "Провести собеседование по папке"
+              }
+            >
+              <Sparkles size={16} /> Чат с AI
             </button>
             <button
               className="primary-btn"

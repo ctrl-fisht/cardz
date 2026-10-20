@@ -318,8 +318,8 @@ export function NoteEditor({
 
           <div className="editor-footnote">
             <FileCode2 size={13} />
-            Файл: {note ? `notes/${note.id}.crd` : "новый файл в notes/"} ·
-            Markdown + YAML front matter
+            Файл: {note ? note.path : "новый файл в notes/"} · Markdown + YAML
+            front matter
           </div>
         </div>
 
@@ -361,8 +361,8 @@ export function NoteEditor({
             </div>
             <h3>Удалить заметку?</h3>
             <p>
-              Файл <code>notes/{note?.id}.crd</code> и прогресс по его
-              карточкам будут удалены безвозвратно.
+              Файл <code>{note?.path}</code> и прогресс по его карточкам будут
+              удалены безвозвратно.
             </p>
             <div className="confirm-actions">
               <button

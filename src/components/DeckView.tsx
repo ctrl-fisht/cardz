@@ -8,10 +8,11 @@ import {
   Play,
   Plus,
   Search,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import { api } from "../lib/api";
-import type { Deck, NoteDetail, NoteSummary, StartReview } from "../lib/types";
+import type { Deck, NoteDetail, NoteSummary, StartInterview, StartReview } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { NoteEditor } from "./NoteEditor";
 
@@ -32,12 +33,14 @@ export function DeckView({
   deck,
   version,
   onStartReview,
+  onStartInterview,
   onDeleteDeck,
   onRefresh,
 }: {
   deck: Deck;
   version: number;
   onStartReview: StartReview;
+  onStartInterview: StartInterview;
   onDeleteDeck: (deck: Deck) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
@@ -133,6 +136,20 @@ export function DeckView({
               {deck.counts.total > 0 && (
                 <span className="btn-count">{deck.counts.total}</span>
               )}
+            </button>
+            <button
+              className="ghost-btn"
+              disabled={deck.counts.total === 0}
+              onClick={() =>
+                onStartInterview({ kind: "deck", id: deck.id }, deck.name)
+              }
+              title={
+                deck.counts.total === 0
+                  ? "Сначала добавьте карточки"
+                  : "Провести собеседование по колоде"
+              }
+            >
+              <Sparkles size={16} /> Чат с AI
             </button>
             <button className="ghost-btn" onClick={() => setEditor("new")}>
               <FilePlus2 size={16} /> Добавить

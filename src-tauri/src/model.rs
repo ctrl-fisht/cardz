@@ -70,6 +70,7 @@ pub struct NoteSummary {
 pub struct NoteDetail {
     pub id: String,
     pub deck_id: String,
+    pub path: String,
     pub note_type: String,
     pub tags: Vec<String>,
     pub fields: HashMap<String, String>,
@@ -157,6 +158,12 @@ pub struct GroupMeta {
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+}
+
+pub struct AiMaterial {
+    pub text: String,
+    pub total_notes: usize,
+    pub included_notes: usize,
 }
 
 #[derive(Deserialize, Default)]

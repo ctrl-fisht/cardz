@@ -1,12 +1,24 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FolderOpen, Layers, Loader2, Plus, RefreshCw } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { DeckView } from "./components/DeckView";
 import { GroupView } from "./components/GroupView";
 import { Review } from "./components/Review";
+import { SyncPanel } from "./components/SyncPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { Interview } from "./components/Interview";
+import { AssistantPanel } from "./components/AssistantPanel";
 import { api } from "./lib/api";
-import type { Deck, ReviewTarget, StartReview, VaultInfo } from "./lib/types";
+import type {
+  Deck,
+  ReviewScope,
+  ReviewTarget,
+  StartReview,
+  SyncStatus,
+  VaultInfo,
+} from "./lib/types";
 
 type Selection = { kind: "deck" | "group"; id: string };
 
@@ -17,6 +29,16 @@ export default function App() {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [reviewTarget, setReviewTarget] = useState<ReviewTarget | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantDeckId, setAssistantDeckId] = useState<string | null>(null);
+  const [interview, setInterview] = useState<
+    | { kind: "new"; scope: ReviewScope; title: string }
+    | { kind: "history"; id: string }
+    | null
+  >(null);
   const [version, setVersion] = useState(0);
   const [newDeck, setNewDeck] = useState("");
   const [creating, setCreating] = useState(false);
@@ -44,6 +66,14 @@ export default function App() {
     });
   }, []);
 
+  const loadSyncStatus = useCallback(async () => {
+    try {
+      setSyncStatus(await api.syncStatus());
+    } catch {
+      setSyncStatus(null);
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
     const boot = async () => {
@@ -52,6 +82,7 @@ export default function App() {
         if (!alive) return;
         apply(info);
         setFatal(null);
+        void loadSyncStatus();
         try {
           const imported = await api.startupImport();
           if (alive && imported) {
@@ -73,7 +104,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [apply]);
+  }, [apply, loadSyncStatus]);
 
   useEffect(() => {
     if (!notice) return;
@@ -90,6 +121,30 @@ export default function App() {
     }
   }, [apply]);
 
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    void (async () => {
+      const offStatus = await listen<SyncStatus>("sync://status", (event) => {
+        setSyncStatus(event.payload);
+      });
+      const offUpdated = await listen("sync://updated", () => {
+        void refresh();
+        setVersion((value) => value + 1);
+      });
+      if (disposed) {
+        offStatus();
+        offUpdated();
+      } else {
+        unlisteners.push(offStatus, offUpdated);
+      }
+    })().catch(() => undefined);
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, [refresh]);
+
   const openFolder = useCallback(async () => {
     const chosen = await open({ directory: true, multiple: false });
     if (typeof chosen !== "string") return;
@@ -100,10 +155,11 @@ export default function App() {
       setVersion((value) => value + 1);
       setFatal(null);
       setNotice("Хранилище открыто");
+      void loadSyncStatus();
     } catch (err) {
       setNotice(String(err));
     }
-  }, [apply]);
+  }, [apply, loadSyncStatus]);
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -179,6 +235,10 @@ export default function App() {
 
   const startReview = useCallback<StartReview>((scope, title, mode, total) => {
     setReviewTarget({ scope, title, mode, total });
+  }, []);
+
+  const startInterview = useCallback((scope: ReviewScope, title: string) => {
+    setInterview({ kind: "new", scope, title });
   }, []);
 
   const exportDeck = useCallback(async (deck: Deck) => {
@@ -296,11 +356,19 @@ export default function App() {
         onDeleteDeck={deleteDeck}
         onDeleteGroup={deleteGroup}
         onStartReview={startReview}
+        onStartInterview={startInterview}
         onExportDeck={(deck) => void exportDeck(deck)}
         onImportDeck={() => void importDeck()}
         onOpenVault={() => void openFolder()}
         onSync={() => void sync()}
         syncing={syncing}
+        syncStatus={syncStatus}
+        onOpenSync={() => setSyncOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenAssistant={() => {
+          setAssistantDeckId(selection?.kind === "deck" ? selection.id : null);
+          setAssistantOpen(true);
+        }}
       />
 
       {selectedGroup ? (
@@ -310,6 +378,7 @@ export default function App() {
           decks={groupDecks}
           onSelectDeck={(id) => setSelection({ kind: "deck", id })}
           onStartReview={startReview}
+          onStartInterview={startInterview}
           onDeleteGroup={deleteGroup}
         />
       ) : selectedDeck ? (
@@ -318,6 +387,7 @@ export default function App() {
           deck={selectedDeck}
           version={version}
           onStartReview={startReview}
+          onStartInterview={startInterview}
           onDeleteDeck={deleteDeck}
           onRefresh={refresh}
         />
@@ -371,6 +441,55 @@ export default function App() {
       )}
 
       {notice && <div className="toast">{notice}</div>}
+
+      {syncOpen && (
+        <SyncPanel
+          initial={syncStatus}
+          onClose={() => setSyncOpen(false)}
+          onStatus={setSyncStatus}
+          onChanged={() => {
+            void refresh();
+            setVersion((value) => value + 1);
+          }}
+        />
+      )}
+
+      {interview && (
+        <Interview
+          target={interview}
+          vault={vault}
+          onClose={() => setInterview(null)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onChanged={() => {
+            void refresh();
+            setVersion((value) => value + 1);
+          }}
+          onStartReview={startReview}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsPanel
+          onClose={() => setSettingsOpen(false)}
+          onOpenInterview={(id) => {
+            setSettingsOpen(false);
+            setInterview({ kind: "history", id });
+          }}
+        />
+      )}
+
+      {assistantOpen && (
+        <AssistantPanel
+          vault={vault}
+          initialDeckId={assistantDeckId}
+          onClose={() => setAssistantOpen(false)}
+          onChanged={() => {
+            void refresh();
+            setVersion((value) => value + 1);
+          }}
+          onStartReview={startReview}
+        />
+      )}
     </div>
   );
 }

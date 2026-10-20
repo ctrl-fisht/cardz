@@ -1,15 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AiCardProposal,
+  AiSettings,
+  AiStatus,
   AnswerResult,
+  CommitResult,
   CreateDeckResult,
   CreateGroupResult,
+  InterviewRecord,
+  InterviewStartResult,
+  InterviewSummary,
   NoteDetail,
   NoteSummary,
+  ResumeResult,
   ReviewCard,
   ReviewScope,
   SaveNoteInput,
+  SyncStatus,
   Template,
   VaultInfo,
+  VerdictResult,
 } from "./types";
 
 export const api = {
@@ -56,4 +66,61 @@ export const api = {
     }),
   answerCard: (cardId: string, rating: number) =>
     invoke<AnswerResult>("answer_card", { cardId, rating }),
+  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  syncConnect: (remote: string, branch: string, autoSync: boolean) =>
+    invoke<SyncStatus>("sync_connect", { remote, branch, autoSync }),
+  syncNow: () => invoke<SyncStatus>("sync_now"),
+  syncPull: () => invoke<SyncStatus>("sync_pull"),
+  syncDisconnect: () => invoke<SyncStatus>("sync_disconnect"),
+  syncResolve: (path: string, side: "local" | "remote") =>
+    invoke<SyncStatus>("sync_resolve", { path, side }),
+  syncAbort: () => invoke<SyncStatus>("sync_abort"),
+  aiSettingsGet: () => invoke<AiSettings>("ai_settings_get"),
+  aiSettingsSave: (settings: AiSettings) =>
+    invoke<AiSettings>("ai_settings_save", { settings }),
+  aiStatus: () => invoke<AiStatus>("ai_status"),
+  aiModels: () => invoke<string[]>("ai_models"),
+  aiInterviewStart: (scope: ReviewScope, title: string) =>
+    invoke<InterviewStartResult>("ai_interview_start", { scope, title }),
+  aiInterviewSend: (sessionId: string, message: string) =>
+    invoke<string>("ai_interview_send", { sessionId, message }),
+  aiInterviewVerdict: (sessionId: string, objection?: string | null) =>
+    invoke<VerdictResult>("ai_interview_verdict", {
+      sessionId,
+      objection: objection ?? null,
+    }),
+  aiInterviewCards: (sessionId: string) =>
+    invoke<AiCardProposal[]>("ai_interview_cards", { sessionId }),
+  aiInterviewCommit: (
+    interviewId: string,
+    deckId: string,
+    cards: AiCardProposal[],
+  ) =>
+    invoke<CommitResult>("ai_interview_commit", {
+      interviewId,
+      deckId,
+      cards,
+    }),
+  aiAssistantGenerate: (
+    deckId: string,
+    request: string,
+    existing: string[],
+    count?: number,
+  ) =>
+    invoke<AiCardProposal[]>("ai_assistant_generate", {
+      deckId,
+      request,
+      existing,
+      count: count ?? null,
+    }),
+  aiAssistantCommit: (deckId: string, cards: AiCardProposal[]) =>
+    invoke<CommitResult>("ai_assistant_commit", { deckId, cards }),
+  aiInterviewAbort: (sessionId: string) =>
+    invoke<void>("ai_interview_abort", { sessionId }),
+  aiInterviewResume: (interviewId: string) =>
+    invoke<ResumeResult>("ai_interview_resume", { interviewId }),
+  aiHistoryList: () => invoke<InterviewSummary[]>("ai_history_list"),
+  aiHistoryGet: (id: string) => invoke<InterviewRecord>("ai_history_get", { id }),
+  aiHistoryDelete: (id: string) => invoke<void>("ai_history_delete", { id }),
+  aiHistoryClear: () => invoke<void>("ai_history_clear"),
 };

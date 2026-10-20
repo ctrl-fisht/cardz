@@ -8,7 +8,11 @@ import {
   type ReactNode,
 } from "react";
 import {
+  AlertTriangle,
+  Check,
   ChevronRight,
+  Cloud,
+  CloudOff,
   Download,
   Folder,
   FolderOpen,
@@ -19,10 +23,19 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Settings2,
+  Sparkles,
   Trash2,
   Upload,
 } from "lucide-react";
-import type { Deck, Group, StartReview, VaultInfo } from "../lib/types";
+import type {
+  Deck,
+  Group,
+  StartInterview,
+  StartReview,
+  SyncStatus,
+  VaultInfo,
+} from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 type TreeNode = {
@@ -149,11 +162,16 @@ export function Sidebar({
   onDeleteDeck,
   onDeleteGroup,
   onStartReview,
+  onStartInterview,
   onExportDeck,
   onImportDeck,
   onOpenVault,
   onSync,
   syncing,
+  syncStatus,
+  onOpenSync,
+  onOpenSettings,
+  onOpenAssistant,
 }: {
   vault: VaultInfo;
   selectedDeckId: string | null;
@@ -166,11 +184,16 @@ export function Sidebar({
   onDeleteDeck: (deck: Deck) => Promise<void>;
   onDeleteGroup: (groupId: string) => Promise<void>;
   onStartReview: StartReview;
+  onStartInterview: StartInterview;
   onExportDeck: (deck: Deck) => void;
   onImportDeck: () => void;
   onOpenVault: () => void;
   onSync: () => void;
   syncing: boolean;
+  syncStatus: SyncStatus | null;
+  onOpenSync: () => void;
+  onOpenSettings: () => void;
+  onOpenAssistant: () => void;
 }) {
   const tree = useMemo(
     () => buildTree(vault.decks, vault.groups),
@@ -219,6 +242,69 @@ export function Sidebar({
     moved: boolean;
   } | null>(null);
   const suppressClickRef = useRef(false);
+
+  const syncPresentation = (): {
+    label: string;
+    className: string;
+    icon: ReactNode;
+  } => {
+    if (!syncStatus) {
+      return {
+        label: "не настроена",
+        className: "off",
+        icon: <CloudOff size={15} />,
+      };
+    }
+    if (!syncStatus.gitAvailable) {
+      return {
+        label: "git не найден",
+        className: "error",
+        icon: <AlertTriangle size={15} />,
+      };
+    }
+    if (!syncStatus.configured) {
+      return {
+        label: "не настроена",
+        className: "off",
+        icon: <CloudOff size={15} />,
+      };
+    }
+    if (syncStatus.conflicts.length > 0) {
+      return {
+        label: "конфликт",
+        className: "conflict",
+        icon: <AlertTriangle size={15} />,
+      };
+    }
+    if (syncStatus.syncing) {
+      return {
+        label: "синхронизация…",
+        className: "syncing",
+        icon: <Loader2 size={15} className="spin" />,
+      };
+    }
+    if (syncStatus.error) {
+      return {
+        label: "ошибка",
+        className: "error",
+        icon: <AlertTriangle size={15} />,
+      };
+    }
+    if (syncStatus.dirty || syncStatus.ahead > 0 || syncStatus.behind > 0) {
+      return {
+        label: "есть изменения",
+        className: "pending",
+        icon: <Cloud size={15} />,
+      };
+    }
+    return {
+      label: "синхронизировано",
+      className: "ok",
+      icon: <Check size={15} />,
+    };
+  };
+
+  const syncInfo = syncPresentation();
 
   useEffect(() => {
     localStorage.setItem("cardz.collapsedGroups", JSON.stringify([...collapsed]));
@@ -633,6 +719,18 @@ export function Sidebar({
       <div className="side-spacer" />
 
       <div className="side-footer">
+        <button
+          className={`sync-status-btn ${syncInfo.className}`}
+          onClick={onOpenSync}
+          title="Настройки синхронизации"
+        >
+          <span className="sync-status-icon">{syncInfo.icon}</span>
+          <span className="sync-status-text">
+            <span className="sync-status-title">Синхронизация</span>
+            <span className="sync-status-label">{syncInfo.label}</span>
+          </span>
+          <span className="sync-status-dot" />
+        </button>
         <div className="vault-card" title={vault.root}>
           <Layers size={15} />
           <div>
@@ -640,6 +738,14 @@ export function Sidebar({
             <div className="vault-path">{vault.root}</div>
           </div>
         </div>
+        <button
+          className="assistant-entry"
+          onClick={onOpenAssistant}
+          title="Попросить ИИ создать карточки"
+        >
+          <Sparkles size={15} />
+          <span>ИИ-ассистент</span>
+        </button>
         <div className="side-actions">
           <button className="side-action" onClick={onOpenVault}>
             <FolderOpen size={14} /> Сменить папку
@@ -658,6 +764,13 @@ export function Sidebar({
             disabled={syncing}
           >
             <RefreshCw size={15} className={syncing ? "spin" : ""} />
+          </button>
+          <button
+            className="icon-btn"
+            onClick={onOpenSettings}
+            title="Настройки"
+          >
+            <Settings2 size={15} />
           </button>
         </div>
       </div>
@@ -724,6 +837,19 @@ export function Sidebar({
                 <InfinityIcon size={14} /> Все карточки ·{" "}
                 {menu.deck.counts.total}
               </button>
+              <button
+                className="context-item"
+                disabled={menu.deck.counts.total === 0}
+                onClick={() => {
+                  onStartInterview(
+                    { kind: "deck", id: menu.deck.id },
+                    menu.deck.name,
+                  );
+                  setMenu(null);
+                }}
+              >
+                <Sparkles size={14} /> Чат с AI
+              </button>
               <div className="context-sep" />
               <button
                 className="context-item"
@@ -787,6 +913,16 @@ export function Sidebar({
                 }}
               >
                 <InfinityIcon size={14} /> Все карточки · {menu.counts.total}
+              </button>
+              <button
+                className="context-item"
+                disabled={menu.counts.total === 0}
+                onClick={() => {
+                  onStartInterview({ kind: "group", id: menu.id }, menu.name);
+                  setMenu(null);
+                }}
+              >
+                <Sparkles size={14} /> Чат с AI
               </button>
               <div className="context-sep" />
               <button

@@ -181,6 +181,7 @@ impl Vault {
         Ok(NoteDetail {
             id: parsed.id,
             deck_id: deck_id.to_string(),
+            path: rel,
             note_type: parsed.note_type,
             tags: parsed.tags,
             fields: parsed.fields,
@@ -220,9 +221,23 @@ impl Vault {
             .optional()
             .map_err(|e| e.to_string())?;
 
-        let root_rel =
-            existing_rel.unwrap_or_else(|| format!("{}/notes/{}.crd", input.deck_id, note_id));
-        let path = safe_join(&self.root, &root_rel)?;
+        let path = if let Some(rel) = existing_rel {
+            safe_join(&self.root, &rel)?
+        } else {
+            let notes_dir = deck_dir.join("notes");
+            fs::create_dir_all(&notes_dir).map_err(|e| e.to_string())?;
+            let front = fields
+                .get("front")
+                .cloned()
+                .or_else(|| {
+                    template
+                        .fields
+                        .first()
+                        .and_then(|field| fields.get(field).cloned())
+                })
+                .unwrap_or_default();
+            unique_note_path(&notes_dir, &note_slug(&front))
+        };
 
         write_note_file(
             &path,
@@ -232,11 +247,13 @@ impl Vault {
             &fields,
             &template.fields,
         )?;
+        let rel_path = relative_string(&self.root, &path);
         self.sync()?;
 
         Ok(NoteDetail {
             id: note_id,
             deck_id: input.deck_id,
+            path: rel_path,
             note_type: input.note_type,
             tags: input.tags,
             fields,
@@ -648,6 +665,152 @@ impl Vault {
             }
             ReviewScope::All => Ok(ids),
         }
+    }
+
+    pub fn ai_material(
+        &self,
+        scope: &ReviewScope,
+        max_chars: usize,
+    ) -> Result<AiMaterial, String> {
+        let deck_ids = self.scope_deck_ids(scope)?;
+        if deck_ids.is_empty() {
+            return Ok(AiMaterial {
+                text: String::new(),
+                total_notes: 0,
+                included_notes: 0,
+            });
+        }
+
+        let decks = discover_decks(&self.root)?;
+        let mut deck_meta: HashMap<String, (String, String)> = HashMap::new();
+        for deck in &decks {
+            deck_meta.insert(
+                deck.id.clone(),
+                (deck.name.clone(), deck.description.clone()),
+            );
+        }
+
+        let mut rows: Vec<(String, String, Vec<String>)> = Vec::new();
+        for deck_id in &deck_ids {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, tags FROM notes WHERE deck_id = ?1 ORDER BY path")
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map(params![deck_id], |row| {
+                    let path: String = row.get(0)?;
+                    let tags: String = row.get(1)?;
+                    Ok((path, tags))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in mapped.flatten() {
+                let tags: Vec<String> = serde_json::from_str(&row.1).unwrap_or_default();
+                rows.push((deck_id.clone(), row.0, tags));
+            }
+        }
+
+        let total_notes = rows.len();
+        if total_notes == 0 {
+            return Ok(AiMaterial {
+                text: String::new(),
+                total_notes: 0,
+                included_notes: 0,
+            });
+        }
+
+        let limit = 240.min(total_notes);
+        let selected: Vec<(String, String, Vec<String>)> = if total_notes <= limit {
+            rows
+        } else {
+            let step = total_notes as f64 / limit as f64;
+            (0..limit)
+                .filter_map(|index| rows.get((index as f64 * step) as usize).cloned())
+                .collect()
+        };
+
+        let mut sections: HashMap<String, Vec<(String, String, Vec<String>)>> = HashMap::new();
+        for (deck_id, rel, _tags) in selected {
+            let Ok(path) = safe_join(&self.root, &rel) else {
+                continue;
+            };
+            let Ok(note) = parse_note(&path) else {
+                continue;
+            };
+            let (front, back) = note_question_answer(&note.fields);
+            if front.trim().is_empty() {
+                continue;
+            }
+            sections.entry(deck_id).or_default().push((
+                clean_material_text(&front, 260),
+                clean_material_text(&back, 520),
+                note.tags,
+            ));
+        }
+
+        let title = match scope {
+            ReviewScope::Deck { id } => deck_meta
+                .get(id)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| "Колода".to_string()),
+            ReviewScope::Group { id } => safe_join(&self.root, id)
+                .ok()
+                .map(|dir| read_group_meta(&dir))
+                .and_then(|meta| meta.name)
+                .unwrap_or_else(|| "Папка".to_string()),
+            ReviewScope::All => "Всё хранилище".to_string(),
+        };
+
+        let mut text = String::new();
+        text.push_str(&format!("Тема: {}\n", title));
+        if total_notes > limit {
+            text.push_str(&format!(
+                "Это выборка {} из {} карточек.\n",
+                limit, total_notes
+            ));
+        } else {
+            text.push_str(&format!("Карточек в материале: {}.\n", total_notes));
+        }
+
+        let mut included = 0usize;
+        'decks: for deck_id in &deck_ids {
+            let Some(entries) = sections.get(deck_id) else {
+                continue;
+            };
+            if text.chars().count() >= max_chars {
+                break;
+            }
+            let (name, description) = deck_meta
+                .get(deck_id)
+                .cloned()
+                .unwrap_or((prettify_label(deck_id.rsplit('/').next().unwrap_or(deck_id)), String::new()));
+            text.push_str(&format!("\n### {}\n", name));
+            if !description.trim().is_empty() {
+                text.push_str(&format!(
+                    "{}\n",
+                    clean_material_text(&description, 220)
+                ));
+            }
+            for (front, back, tags) in entries {
+                let mut line = format!("- В: {}\n", front);
+                if !back.trim().is_empty() {
+                    line.push_str(&format!("  О: {}\n", back));
+                }
+                if !tags.is_empty() {
+                    line.push_str(&format!("  Теги: {}\n", tags.join(", ")));
+                }
+                if text.chars().count() + line.chars().count() > max_chars {
+                    break 'decks;
+                }
+                text.push_str(&line);
+                included += 1;
+            }
+        }
+
+        Ok(AiMaterial {
+            text,
+            total_notes,
+            included_notes: included,
+        })
     }
 
     pub fn next_card(
@@ -1081,14 +1244,9 @@ impl Vault {
             fields.insert("front".to_string(), front.to_string());
             fields.insert("back".to_string(), back);
             let tag_list: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-            write_note_file(
-                &deck_dir.join("notes").join(format!("{}.crd", id)),
-                &id,
-                "basic",
-                &tag_list,
-                &fields,
-                &order,
-            )?;
+            let notes_dir = deck_dir.join("notes");
+            let path = unique_note_path(&notes_dir, &note_slug(front));
+            write_note_file(&path, &id, "basic", &tag_list, &fields, &order)?;
         }
         self.sync()
     }
@@ -1208,6 +1366,17 @@ fn regenerate_note_ids(root: &Path) -> Result<(), String> {
             continue;
         }
         let path = entry.path();
+        let parsed = parse_note(path).ok();
+        let front = parsed
+            .as_ref()
+            .and_then(|note| note.fields.get("front").cloned())
+            .or_else(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|note| note.fields.values().next().cloned())
+            })
+            .unwrap_or_default();
+        let slug = note_slug(&front);
         let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let new_id = ulid::Ulid::generate().to_string();
         let (front_matter, body) = split_front_matter(&raw);
@@ -1226,12 +1395,15 @@ fn regenerate_note_ids(root: &Path) -> Result<(), String> {
             lines.insert(0, format!("id: {}", new_id));
         }
         let content = format!("---\n{}\n---\n{}", lines.join("\n"), body);
-        let new_path = path
-            .parent()
-            .unwrap_or(root)
-            .join(format!("{}.crd", new_id));
+        let parent = path.parent().unwrap_or(root);
+        let candidate = parent.join(format!("{}.crd", slug));
+        let new_path = if paths_equal_ci(&candidate, path) {
+            candidate
+        } else {
+            unique_note_path(parent, &slug)
+        };
         fs::write(&new_path, content).map_err(|e| e.to_string())?;
-        if new_path != path {
+        if !paths_equal_ci(&new_path, path) {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }
     }
@@ -1461,6 +1633,60 @@ fn template_fields(
         .unwrap_or_else(|| vec!["front".to_string(), "back".to_string()])
 }
 
+fn note_question_answer(fields: &HashMap<String, String>) -> (String, String) {
+    let front_keys = ["front", "question", "term", "prompt"];
+    let back_keys = ["back", "answer", "definition", "translation", "meaning"];
+    let front_key = front_keys.iter().find(|key| fields.contains_key(**key)).copied();
+    let front = front_key
+        .and_then(|key| fields.get(key))
+        .cloned()
+        .unwrap_or_default();
+    let back = back_keys
+        .iter()
+        .find_map(|key| fields.get(*key))
+        .cloned()
+        .unwrap_or_else(|| {
+            fields
+                .iter()
+                .filter(|(key, _)| Some(key.as_str()) != front_key)
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    (front, back)
+}
+
+fn clean_material_text(raw: &str, max: usize) -> String {
+    let mut pieces = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("![")
+            || trimmed.contains("](media/")
+            || trimmed.starts_with("<img")
+        {
+            continue;
+        }
+        pieces.push(trimmed);
+    }
+    let mut cleaned = String::new();
+    let mut in_tag = false;
+    for ch in pieces.join(" ").chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => cleaned.push(ch),
+            _ => {}
+        }
+    }
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        format!("{}…", collapsed.chars().take(max).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
 fn make_preview(fields: &HashMap<String, String>) -> String {
     let text = fields
         .get("front")
@@ -1530,6 +1756,135 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(root.join(safe_relative(rel)?))
 }
 
+const RESERVED_WINDOWS_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+    "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn note_slug(front: &str) -> String {
+    let text = strip_markdown(front);
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in text.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let mut slug: String = out.trim_matches('-').chars().take(60).collect();
+    slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        return "note".to_string();
+    }
+    if RESERVED_WINDOWS_NAMES
+        .iter()
+        .any(|reserved| slug.eq_ignore_ascii_case(reserved))
+    {
+        return format!("note-{}", slug);
+    }
+    slug
+}
+
+fn strip_markdown(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '!' && index + 1 < chars.len() && chars[index + 1] == '[' {
+            let mut end = index + 2;
+            let start = end;
+            while end < chars.len() && chars[end] != ']' {
+                end += 1;
+            }
+            out.extend(chars[start..end].iter().copied());
+            if end < chars.len() {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == '(' {
+                while end < chars.len() && chars[end] != ')' {
+                    end += 1;
+                }
+                if end < chars.len() {
+                    end += 1;
+                }
+            }
+            index = end;
+            continue;
+        }
+        if chars[index] == '[' {
+            let mut end = index + 1;
+            let start = end;
+            while end < chars.len() && chars[end] != ']' {
+                end += 1;
+            }
+            out.extend(chars[start..end].iter().copied());
+            if end < chars.len() {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == '(' {
+                while end < chars.len() && chars[end] != ')' {
+                    end += 1;
+                }
+                if end < chars.len() {
+                    end += 1;
+                }
+            }
+            index = end;
+            continue;
+        }
+        if chars[index] == '<' {
+            let mut end = index + 1;
+            while end < chars.len() && chars[end] != '>' {
+                end += 1;
+            }
+            if end < chars.len() {
+                index = end + 1;
+                continue;
+            }
+        }
+        if matches!(chars[index], '#' | '*' | '_' | '`' | '~' | '>') {
+            index += 1;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+fn unique_note_path(notes_dir: &Path, slug: &str) -> PathBuf {
+    let mut number = 1;
+    loop {
+        let name = if number == 1 {
+            format!("{}.crd", slug)
+        } else {
+            format!("{}-{}.crd", slug, number)
+        };
+        if !file_name_taken(notes_dir, &name) {
+            return notes_dir.join(name);
+        }
+        number += 1;
+    }
+}
+
+fn file_name_taken(dir: &Path, name: &str) -> bool {
+    let target = name.to_lowercase();
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name().to_string_lossy().to_lowercase() == target
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn paths_equal_ci(first: &Path, second: &Path) -> bool {
+    first.to_string_lossy().to_lowercase() == second.to_string_lossy().to_lowercase()
+}
+
 fn sanitize_segment(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -1553,12 +1908,10 @@ fn sanitize_segment(name: &str) -> String {
     if result.is_empty() {
         result = "deck".to_string();
     }
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
-        "LPT8", "LPT9",
-    ];
-    if RESERVED.iter().any(|reserved| result.eq_ignore_ascii_case(reserved)) {
+    if RESERVED_WINDOWS_NAMES
+        .iter()
+        .any(|reserved| result.eq_ignore_ascii_case(reserved))
+    {
         result.push('_');
     }
     result
@@ -1814,6 +2167,86 @@ mod review_scope_tests {
         assert!(info.decks.is_empty());
         assert!(vault.info().unwrap().groups.is_empty());
         assert!(vault.delete_group("Folder").is_err());
+
+        drop(vault);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod note_name_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("cardz-name-{}-{}", name, stamp));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn slug_filenames_are_stable_and_unique() {
+        assert_eq!(note_slug("¿Cómo se dice «бежать»?"), "cómo-se-dice-бежать");
+        assert_eq!(note_slug("**Bold** [link](https://example.com)"), "bold-link");
+        assert_eq!(note_slug(""), "note");
+        assert_eq!(note_slug("CON"), "note-con");
+        assert!(note_slug(&"x".repeat(200)).chars().count() <= 60);
+
+        let root = temp_dir("slug");
+        let mut vault = Vault::open(root.clone()).unwrap();
+        let deck_id = vault.create_deck("Deck", "").unwrap();
+
+        let mut fields = HashMap::new();
+        fields.insert("front".to_string(), "Как хранятся карточки?".to_string());
+        fields.insert("back".to_string(), "Ответ".to_string());
+        let first = vault
+            .save_note(SaveNoteInput {
+                deck_id: deck_id.clone(),
+                note_id: None,
+                note_type: "basic".to_string(),
+                tags: vec![],
+                fields: fields.clone(),
+            })
+            .unwrap();
+        assert!(
+            first.path.ends_with("notes/как-хранятся-карточки.crd"),
+            "{}",
+            first.path
+        );
+
+        let second = vault
+            .save_note(SaveNoteInput {
+                deck_id: deck_id.clone(),
+                note_id: None,
+                note_type: "basic".to_string(),
+                tags: vec![],
+                fields: fields.clone(),
+            })
+            .unwrap();
+        assert!(
+            second.path.ends_with("notes/как-хранятся-карточки-2.crd"),
+            "{}",
+            second.path
+        );
+
+        let mut changed = HashMap::new();
+        changed.insert("front".to_string(), "Новый вопрос".to_string());
+        changed.insert("back".to_string(), "Ответ".to_string());
+        let edited = vault
+            .save_note(SaveNoteInput {
+                deck_id,
+                note_id: Some(first.id.clone()),
+                note_type: "basic".to_string(),
+                tags: vec![],
+                fields: changed,
+            })
+            .unwrap();
+        assert_eq!(edited.path, first.path);
+        assert!(root.join(&first.path).is_file());
 
         drop(vault);
         let _ = fs::remove_dir_all(root);

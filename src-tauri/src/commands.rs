@@ -1,6 +1,8 @@
+use crate::ai::AiRuntime;
+use crate::config;
 use crate::model::*;
+use crate::sync::SyncRuntime;
 use crate::vault::Vault;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -9,38 +11,8 @@ use tauri::{AppHandle, Manager, State};
 pub struct AppState {
     pub vault: Mutex<Option<Vault>>,
     pub pending_import: Mutex<Option<PathBuf>>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Config {
-    #[serde(default)]
-    vault: Option<String>,
-}
-
-fn read_config(app: &AppHandle) -> Config {
-    let Ok(dir) = app.path().app_config_dir() else {
-        return Config::default();
-    };
-    fs::read_to_string(dir.join("config.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-fn save_config(app: &AppHandle, root: &Path) -> Result<(), String> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| format!("Не удалось найти папку конфигурации: {}", e))?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let config = Config {
-        vault: Some(root.to_string_lossy().to_string()),
-    };
-    fs::write(
-        dir.join("config.json"),
-        serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+    pub sync: Mutex<SyncRuntime>,
+    pub ai: tokio::sync::Mutex<AiRuntime>,
 }
 
 #[tauri::command]
@@ -53,7 +25,7 @@ pub fn init_vault(app: AppHandle, state: State<'_, AppState>) -> Result<VaultInf
         return vault.info();
     }
 
-    let configured = read_config(&app)
+    let configured = config::read_config(&app)
         .vault
         .map(PathBuf::from)
         .filter(|path| path.is_dir());
@@ -75,7 +47,7 @@ pub fn init_vault(app: AppHandle, state: State<'_, AppState>) -> Result<VaultInf
     let info = vault.info()?;
     *guard = Some(vault);
     drop(guard);
-    save_config(&app, &root)?;
+    config::save_vault(&app, &root)?;
     Ok(info)
 }
 
@@ -97,7 +69,7 @@ pub fn open_vault(
         .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
     *guard = Some(vault);
     drop(guard);
-    save_config(&app, &root)?;
+    config::save_vault(&app, &root)?;
     Ok(info)
 }
 
