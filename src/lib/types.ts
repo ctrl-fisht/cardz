@@ -18,6 +18,23 @@ export type VaultInfo = {
   root: string;
   name: string;
   decks: Deck[];
+  groups: Group[];
+};
+
+export type Group = {
+  id: string;
+  name: string;
+  path: string;
+};
+
+export type CreateDeckResult = {
+  vault: VaultInfo;
+  deckId: string;
+};
+
+export type CreateGroupResult = {
+  vault: VaultInfo;
+  groupId: string;
 };
 
 export type NoteSummary = {
@@ -43,6 +60,27 @@ export type CardTemplate = {
   front: string;
   back: string;
 };
+
+export type ReviewMode = "scheduled" | "all";
+
+export type ReviewScope =
+  | { kind: "deck"; id: string }
+  | { kind: "group"; id: string }
+  | { kind: "all" };
+
+export type ReviewTarget = {
+  scope: ReviewScope;
+  title: string;
+  mode: ReviewMode;
+  total: number;
+};
+
+export type StartReview = (
+  scope: ReviewScope,
+  title: string,
+  mode: ReviewMode,
+  total: number,
+) => void;
 
 export type Template = {
   id: string;

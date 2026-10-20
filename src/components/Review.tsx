@@ -10,7 +10,7 @@ import {
 import { api } from "../lib/api";
 import { Markdown } from "../lib/markdown";
 import { renderTemplate } from "../lib/template";
-import type { Deck, ReviewCard } from "../lib/types";
+import type { ReviewCard, ReviewTarget } from "../lib/types";
 
 const RATINGS = [
   { value: 1, key: "again", label: "Снова", className: "again" },
@@ -20,11 +20,11 @@ const RATINGS = [
 ] as const;
 
 export function Review({
-  deck,
+  target,
   onExit,
   onReviewed,
 }: {
-  deck: Deck;
+  target: ReviewTarget;
   onExit: () => void;
   onReviewed: () => void;
 }) {
@@ -37,12 +37,19 @@ export function Review({
   const [toast, setToast] = useState<string | null>(null);
   const busyRef = useRef(false);
   const toastTimer = useRef<number | null>(null);
+  const seenRef = useRef<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.nextCard(deck.id);
+      const exclude =
+        target.mode === "all" ? [...seenRef.current] : ([] as string[]);
+      const next = await api.nextCard(
+        target.scope,
+        target.mode === "all",
+        exclude,
+      );
       setCard(next);
       setRevealed(false);
       setAnswered(null);
@@ -51,7 +58,7 @@ export function Review({
     } finally {
       setLoading(false);
     }
-  }, [deck.id]);
+  }, [target]);
 
   useEffect(() => {
     void load();
@@ -67,6 +74,7 @@ export function Review({
       setAnswered(rating);
       try {
         const result = await api.answerCard(card.cardId, rating);
+        if (target.mode === "all") seenRef.current.add(card.cardId);
         setReviewed((value) => value + 1);
         onReviewed();
         setToast(`Следующее повторение: ${result.label.toLowerCase()}`);
@@ -80,7 +88,7 @@ export function Review({
         busyRef.current = false;
       }
     },
-    [card, load, onReviewed],
+    [card, load, onReviewed, target.mode],
   );
 
   useEffect(() => {
@@ -105,19 +113,35 @@ export function Review({
     ? renderTemplate(card.back, card.fields, frontText)
     : "";
 
+  const subtitle = card
+    ? target.scope.kind === "deck"
+      ? card.cardName
+      : `${card.deckName} · ${card.cardName}`
+    : "";
+
+  const progress =
+    target.mode === "all"
+      ? `${reviewed} / ${target.total}`
+      : reviewed > 0
+        ? `${reviewed} ответов`
+        : "Начало сессии";
+
   return (
     <div className="review">
       <header className="review-top">
         <button className="ghost-btn" onClick={onExit}>
-          <ArrowLeft size={16} /> К колоде
+          <ArrowLeft size={16} /> Назад
         </button>
         <div className="review-title">
-          <span className="review-deck">{deck.name}</span>
-          {card && <span className="review-card-name">{card.cardName}</span>}
+          <span className="review-deck">
+            {target.title}
+            <span className="review-mode">
+              {target.mode === "all" ? "все карточки" : "по расписанию"}
+            </span>
+          </span>
+          {card && <span className="review-card-name">{subtitle}</span>}
         </div>
-        <div className="review-progress">
-          {reviewed > 0 ? `${reviewed} ответов` : "Начало сессии"}
-        </div>
+        <div className="review-progress">{progress}</div>
       </header>
 
       <div className="review-body">
@@ -143,14 +167,20 @@ export function Review({
             <div className="done-icon">
               <PartyPopper size={30} />
             </div>
-            <h2>На сегодня всё</h2>
+            <h2>
+              {target.mode === "all" ? "Все карточки пройдены" : "На сегодня всё"}
+            </h2>
             <p>
-              {reviewed > 0
-                ? `Вы ответили на ${reviewed} карточек. Следующая порция вернётся по расписанию.`
-                : "В этой колоде нет карточек к повторению. Добавьте новые или загляните позже."}
+              {target.mode === "all"
+                ? reviewed > 0
+                  ? `Вы прошли ${reviewed} из ${target.total} карточек. Ответы сохранены в прогресс.`
+                  : "В выбранной области нет карточек."
+                : reviewed > 0
+                  ? `Вы ответили на ${reviewed} карточек. Следующая порция вернётся по расписанию.`
+                  : "В выбранной области нет карточек к повторению. Загляните позже."}
             </p>
             <button className="primary-btn" onClick={onExit}>
-              <CheckCircle2 size={16} /> Вернуться к колоде
+              <CheckCircle2 size={16} /> Вернуться
             </button>
           </div>
         )}
@@ -159,6 +189,9 @@ export function Review({
           <div className={`review-card ${revealed ? "revealed" : ""}`}>
             <div className="review-tags">
               {card.isNew && <span className="new-chip">Новая</span>}
+              {target.mode === "all" && (
+                <span className="new-chip all-chip">вне расписания</span>
+              )}
               {card.tags.map((tag) => (
                 <span key={tag} className="tag">
                   {tag}

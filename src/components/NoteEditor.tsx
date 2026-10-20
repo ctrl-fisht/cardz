@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
-  Eye,
-  EyeOff,
   FileCode2,
   ImagePlus,
   Loader2,
@@ -12,6 +10,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import { Markdown } from "../lib/markdown";
+import { rewriteImageWidth } from "../lib/media";
 import { fieldLabel, renderTemplate } from "../lib/template";
 import type { Deck, NoteDetail, Template } from "../lib/types";
 
@@ -32,10 +31,10 @@ export function NoteEditor({
     note?.fields ?? {},
   );
   const [tags, setTags] = useState(note?.tags.join(", ") ?? "");
-  const [previewMode, setPreviewMode] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeField, setActiveField] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const refs = useRef<Record<string, HTMLTextAreaElement | null>>({});
 
   useEffect(() => {
@@ -69,11 +68,16 @@ export function NoteEditor({
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
+      if (event.key !== "Escape") return;
+      if (confirmDelete) {
+        setConfirmDelete(false);
+        return;
+      }
+      if (!busy) onClose();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [busy, onClose]);
+  }, [busy, confirmDelete, onClose]);
 
   const template = templates.find((item) => item.id === typeId) ?? templates[0];
   const fieldKeys = template?.fields ?? ["front", "back"];
@@ -121,10 +125,10 @@ export function NoteEditor({
       const text = fields[field] ?? "";
       const start = textarea?.selectionStart ?? text.length;
       const end = textarea?.selectionEnd ?? text.length;
-      const prefix = start > 0 && !text.slice(0, start).endsWith("\n") ? "\n\n" : "";
+      const prefix =
+        start > 0 && !text.slice(0, start).endsWith("\n") ? "\n\n" : "";
       const snippet = `![](${rel})`;
-      const next =
-        text.slice(0, start) + prefix + snippet + text.slice(end);
+      const next = text.slice(0, start) + prefix + snippet + text.slice(end);
       setFields((prev) => ({ ...prev, [field]: next }));
       window.requestAnimationFrame(() => {
         const element = refs.current[field];
@@ -135,6 +139,19 @@ export function NoteEditor({
     } catch (err) {
       setError(String(err));
     }
+  };
+
+  const resizeMedia = (src: string, width: string) => {
+    setFields((prev) => {
+      const next: Record<string, string> = {};
+      let changed = false;
+      for (const [key, value] of Object.entries(prev)) {
+        const updated = rewriteImageWidth(value, src, width);
+        if (updated !== value) changed = true;
+        next[key] = updated;
+      }
+      return changed ? next : prev;
+    });
   };
 
   const save = async () => {
@@ -161,22 +178,17 @@ export function NoteEditor({
     }
   };
 
-  const remove = async () => {
+  const performDelete = async () => {
     if (!note) return;
-    const ok = await confirm("Удалить заметку и все её карточки?", {
-      title: "Удаление заметки",
-      kind: "warning",
-      okLabel: "Удалить",
-      cancelLabel: "Отмена",
-    });
-    if (!ok) return;
     setBusy(true);
+    setError(null);
     try {
       await api.deleteNote(deck.id, note.id);
       onSaved();
     } catch (err) {
       setError(String(err));
       setBusy(false);
+      setConfirmDelete(false);
     }
   };
 
@@ -239,31 +251,12 @@ export function NoteEditor({
             >
               <ImagePlus size={15} /> Медиа
             </button>
-            <button
-              className={`ghost-btn small ${previewMode ? "is-on" : ""}`}
-              onClick={() => setPreviewMode((value) => !value)}
-              type="button"
-            >
-              {previewMode ? <EyeOff size={15} /> : <Eye size={15} />}
-              {previewMode ? "К полям" : "Предпросмотр"}
-            </button>
             <span className="editor-hint">
-              Markdown · полей: {fieldKeys.length}
+              Markdown · предпросмотр обновляется сразу
             </span>
           </div>
 
-          {previewMode ? (
-            <div className="editor-preview">
-              <div className="preview-block">
-                <span className="preview-label">Вопрос</span>
-                <Markdown text={previewFront} deckId={deck.id} />
-              </div>
-              <div className="preview-block answer">
-                <span className="preview-label">Ответ</span>
-                <Markdown text={previewBack} deckId={deck.id} />
-              </div>
-            </div>
-          ) : (
+          <div className="editor-split">
             <div className="fields">
               {fieldKeys.map((field, index) => (
                 <label className="field" key={field}>
@@ -276,7 +269,7 @@ export function NoteEditor({
                     ref={(element) => {
                       refs.current[field] = element;
                     }}
-                    rows={index === 0 ? 4 : 6}
+                    rows={index === 0 ? 6 : 8}
                     value={fields[field] ?? ""}
                     onFocus={() => setActiveField(field)}
                     onChange={(event) =>
@@ -294,7 +287,32 @@ export function NoteEditor({
                 </label>
               ))}
             </div>
-          )}
+
+            <aside className="live-preview">
+              <div className="live-preview-head">
+                <span>Предпросмотр</span>
+                <span className="live-dot" />
+              </div>
+              <div className="preview-block">
+                <span className="preview-label">Вопрос</span>
+                <Markdown
+                  text={previewFront}
+                  deckId={deck.id}
+                  editable
+                  onResize={resizeMedia}
+                />
+              </div>
+              <div className="preview-block answer">
+                <span className="preview-label">Ответ</span>
+                <Markdown
+                  text={previewBack}
+                  deckId={deck.id}
+                  editable
+                  onResize={resizeMedia}
+                />
+              </div>
+            </aside>
+          </div>
 
           {error && <div className="inline-error">{error}</div>}
 
@@ -309,7 +327,7 @@ export function NoteEditor({
           {note && (
             <button
               className="danger-btn"
-              onClick={() => void remove()}
+              onClick={() => setConfirmDelete(true)}
               disabled={busy}
             >
               <Trash2 size={15} /> Удалить
@@ -329,6 +347,47 @@ export function NoteEditor({
           </button>
         </footer>
       </div>
+
+      {confirmDelete && (
+        <div
+          className="confirm-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setConfirmDelete(false);
+          }}
+        >
+          <div className="confirm-dialog">
+            <div className="confirm-icon">
+              <Trash2 size={18} />
+            </div>
+            <h3>Удалить заметку?</h3>
+            <p>
+              Файл <code>notes/{note?.id}.crd</code> и прогресс по его
+              карточкам будут удалены безвозвратно.
+            </p>
+            <div className="confirm-actions">
+              <button
+                className="ghost-btn"
+                onClick={() => setConfirmDelete(false)}
+                disabled={busy}
+              >
+                Отмена
+              </button>
+              <button
+                className="danger-btn solid"
+                onClick={() => void performDelete()}
+                disabled={busy}
+              >
+                {busy ? (
+                  <Loader2 size={15} className="spin" />
+                ) : (
+                  <Trash2 size={15} />
+                )}
+                Удалить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

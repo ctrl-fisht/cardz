@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "./api";
+import { parseImageWidth } from "./media";
 
 const mediaCache = new Map<string, string>();
 const MEDIA_RE = /!\[[^\]]*\]\((media\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
@@ -18,10 +19,14 @@ export function Markdown({
   text,
   deckId,
   className = "",
+  editable = false,
+  onResize,
 }: {
   text: string;
   deckId: string;
   className?: string;
+  editable?: boolean;
+  onResize?: (src: string, width: string) => void;
 }) {
   const links = useMemo(() => extractMedia(text), [text]);
   const linksKey = links.join("|");
@@ -50,8 +55,15 @@ export function Markdown({
     return () => {
       alive = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deckId, linksKey]);
+
+  const sourceByUrl = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [relative, resolved] of Object.entries(urls)) {
+      map.set(resolved, relative);
+    }
+    return map;
+  }, [urls]);
 
   return (
     <div className={`md ${className}`}>
@@ -64,6 +76,38 @@ export function Markdown({
               {children}
             </a>
           ),
+          img: ({ src, alt, title }) => {
+            const width = parseImageWidth(title);
+            const original = (src && sourceByUrl.get(src)) || src || "";
+            const image = (
+              <img
+                src={src}
+                alt={alt ?? ""}
+                style={width ? { width } : undefined}
+              />
+            );
+            if (!editable || !original) return image;
+            return (
+              <span className="md-image">
+                {image}
+                <span className="image-tools">
+                  {["25%", "50%", "75%", "100%"].map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      className={`image-size-btn ${
+                        width === option ? "on" : ""
+                      }`}
+                      onClick={() => onResize?.(original, option)}
+                    >
+                      {option.replace("%", "")}
+                    </button>
+                  ))}
+                  <span className="image-size-label">{width ?? "авто"}</span>
+                </span>
+              </span>
+            );
+          },
         }}
       >
         {text}

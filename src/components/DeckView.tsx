@@ -3,13 +3,16 @@ import {
   ArrowRight,
   FilePlus2,
   FolderTree,
+  Infinity as InfinityIcon,
   Loader2,
+  Play,
   Plus,
   Search,
-  Sparkles,
+  Trash2,
 } from "lucide-react";
 import { api } from "../lib/api";
-import type { Deck, NoteDetail, NoteSummary } from "../lib/types";
+import type { Deck, NoteDetail, NoteSummary, StartReview } from "../lib/types";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { NoteEditor } from "./NoteEditor";
 
 function formatDate(ms: number): string {
@@ -20,15 +23,22 @@ function formatDate(ms: number): string {
   });
 }
 
+function prettySegment(segment: string): string {
+  const spaced = segment.replace(/[-_]+/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
 export function DeckView({
   deck,
   version,
   onStartReview,
+  onDeleteDeck,
   onRefresh,
 }: {
   deck: Deck;
   version: number;
-  onStartReview: () => void;
+  onStartReview: StartReview;
+  onDeleteDeck: (deck: Deck) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
   const [notes, setNotes] = useState<NoteSummary[]>([]);
@@ -37,6 +47,9 @@ export function DeckView({
   const [error, setError] = useState<string | null>(null);
   const [editor, setEditor] = useState<NoteDetail | "new" | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const requestId = useRef(0);
 
   const load = useCallback(async () => {
@@ -78,15 +91,25 @@ export function DeckView({
   };
 
   const totalDue = deck.counts.due + deck.counts.new;
+  const pathParts = deck.id.split("/").filter(Boolean);
 
   return (
     <main className="content">
       <div className="deck-page">
         <header className="deck-head">
           <div>
-            <div className="eyebrow">
+            <div className="eyebrow breadcrumb" title={deck.id}>
               <FolderTree size={13} />
-              Колода
+              {pathParts.map((part, index) => (
+                <span className="crumb" key={`${part}-${index}`}>
+                  {index === pathParts.length - 1
+                    ? deck.name
+                    : prettySegment(part)}
+                  {index < pathParts.length - 1 && (
+                    <span className="crumb-sep">/</span>
+                  )}
+                </span>
+              ))}
             </div>
             <h1>{deck.name}</h1>
             <p className="deck-desc">
@@ -94,17 +117,51 @@ export function DeckView({
             </p>
           </div>
           <div className="head-actions">
+            <button
+              className="ghost-btn"
+              disabled={deck.counts.total === 0}
+              onClick={() =>
+                onStartReview(
+                  { kind: "deck", id: deck.id },
+                  deck.name,
+                  "all",
+                  deck.counts.total,
+                )
+              }
+            >
+              <InfinityIcon size={16} /> Все карточки
+              {deck.counts.total > 0 && (
+                <span className="btn-count">{deck.counts.total}</span>
+              )}
+            </button>
             <button className="ghost-btn" onClick={() => setEditor("new")}>
               <FilePlus2 size={16} /> Добавить
             </button>
             <button
               className="primary-btn"
-              onClick={onStartReview}
+              onClick={() =>
+                onStartReview(
+                  { kind: "deck", id: deck.id },
+                  deck.name,
+                  "scheduled",
+                  totalDue,
+                )
+              }
               disabled={totalDue === 0}
             >
-              <Sparkles size={16} />
+              <Play size={16} />
               Повторять
               {totalDue > 0 && <span className="btn-badge">{totalDue}</span>}
+            </button>
+            <button
+              className="icon-btn danger-icon"
+              title="Удалить колоду"
+              onClick={() => {
+                setDeleteError(null);
+                setConfirmDelete(true);
+              }}
+            >
+              <Trash2 size={16} />
             </button>
           </div>
         </header>
@@ -211,6 +268,36 @@ export function DeckView({
           note={editor === "new" ? null : editor}
           onClose={() => setEditor(null)}
           onSaved={afterSave}
+        />
+      )}
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Удалить колоду?"
+          message={
+            <>
+              Папка <strong>{deck.name}</strong> со всеми заметками, медиа и
+              вложенными колодами будет удалена безвозвратно.
+            </>
+          }
+          busy={deleting}
+          error={deleteError}
+          onCancel={() => {
+            if (!deleting) setConfirmDelete(false);
+          }}
+          onConfirm={async () => {
+            if (deleting) return;
+            setDeleting(true);
+            setDeleteError(null);
+            try {
+              await onDeleteDeck(deck);
+              setConfirmDelete(false);
+            } catch (err) {
+              setDeleteError(String(err));
+            } finally {
+              setDeleting(false);
+            }
+          }}
         />
       )}
     </main>

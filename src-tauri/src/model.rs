@@ -9,6 +9,29 @@ pub struct VaultInfo {
     pub root: String,
     pub name: String,
     pub decks: Vec<Deck>,
+    pub groups: Vec<Group>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDeckResult {
+    pub vault: VaultInfo,
+    pub deck_id: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGroupResult {
+    pub vault: VaultInfo,
+    pub group_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -72,6 +95,14 @@ pub struct CardTemplate {
     pub back: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ReviewScope {
+    Deck { id: String },
+    Group { id: String },
+    All,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewCard {
@@ -118,6 +149,14 @@ pub struct DeckMeta {
     pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+pub struct GroupMeta {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

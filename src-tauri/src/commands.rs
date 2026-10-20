@@ -8,6 +8,7 @@ use tauri::{AppHandle, Manager, State};
 
 pub struct AppState {
     pub vault: Mutex<Option<Vault>>,
+    pub pending_import: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -130,6 +131,46 @@ pub fn create_deck(
     state: State<'_, AppState>,
     name: String,
     description: Option<String>,
+) -> Result<CreateDeckResult, String> {
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_mut()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    let deck_id = vault.create_deck(&name, description.as_deref().unwrap_or(""))?;
+    let vault_info = vault.info()?;
+    Ok(CreateDeckResult {
+        vault: vault_info,
+        deck_id,
+    })
+}
+
+#[tauri::command]
+pub fn create_group(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<CreateGroupResult, String> {
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_mut()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    let group_id = vault.create_group(&name)?;
+    let vault_info = vault.info()?;
+    Ok(CreateGroupResult {
+        vault: vault_info,
+        group_id,
+    })
+}
+
+#[tauri::command]
+pub fn delete_group(
+    state: State<'_, AppState>,
+    group_id: String,
 ) -> Result<VaultInfo, String> {
     let mut guard = state
         .vault
@@ -138,8 +179,111 @@ pub fn create_deck(
     let vault = guard
         .as_mut()
         .ok_or_else(|| "Хранилище не открыто".to_string())?;
-    vault.create_deck(&name, description.as_deref().unwrap_or(""))?;
+    vault.delete_group(&group_id)?;
     vault.info()
+}
+
+#[tauri::command]
+pub fn delete_deck(
+    state: State<'_, AppState>,
+    deck_id: String,
+) -> Result<VaultInfo, String> {
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_mut()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    vault.delete_deck(&deck_id)?;
+    vault.info()
+}
+
+#[tauri::command]
+pub fn move_deck(
+    state: State<'_, AppState>,
+    deck_id: String,
+    target_group: String,
+) -> Result<CreateDeckResult, String> {
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_mut()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    let new_id = vault.move_deck(&deck_id, &target_group)?;
+    let vault_info = vault.info()?;
+    Ok(CreateDeckResult {
+        vault: vault_info,
+        deck_id: new_id,
+    })
+}
+
+#[tauri::command]
+pub fn export_deck(
+    state: State<'_, AppState>,
+    deck_id: String,
+    dest_path: String,
+) -> Result<(), String> {
+    let guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_ref()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    vault.export_deck(&deck_id, Path::new(&dest_path))
+}
+
+#[tauri::command]
+pub fn import_deck(
+    state: State<'_, AppState>,
+    source_path: String,
+) -> Result<CreateDeckResult, String> {
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let vault = guard
+        .as_mut()
+        .ok_or_else(|| "Хранилище не открыто".to_string())?;
+    let deck_id = vault.import_deck(Path::new(&source_path))?;
+    let vault_info = vault.info()?;
+    Ok(CreateDeckResult {
+        vault: vault_info,
+        deck_id,
+    })
+}
+
+#[tauri::command]
+pub fn startup_import(state: State<'_, AppState>) -> Result<Option<CreateDeckResult>, String> {
+    let path = {
+        let mut pending = state
+            .pending_import
+            .lock()
+            .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+        pending.take()
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mut guard = state
+        .vault
+        .lock()
+        .map_err(|_| "Внутренняя ошибка состояния".to_string())?;
+    let Some(vault) = guard.as_mut() else {
+        if let Ok(mut pending) = state.pending_import.lock() {
+            *pending = Some(path);
+        }
+        return Err("Хранилище не открыто".to_string());
+    };
+    let deck_id = vault.import_deck(&path)?;
+    let vault_info = vault.info()?;
+    Ok(Some(CreateDeckResult {
+        vault: vault_info,
+        deck_id,
+    }))
 }
 
 #[tauri::command]
@@ -257,7 +401,9 @@ pub fn read_media(
 #[tauri::command]
 pub fn next_card(
     state: State<'_, AppState>,
-    deck_id: String,
+    scope: ReviewScope,
+    include_future: bool,
+    exclude: Vec<String>,
 ) -> Result<Option<ReviewCard>, String> {
     let guard = state
         .vault
@@ -266,7 +412,7 @@ pub fn next_card(
     let vault = guard
         .as_ref()
         .ok_or_else(|| "Хранилище не открыто".to_string())?;
-    vault.next_card(&deck_id)
+    vault.next_card(&scope, include_future, &exclude)
 }
 
 #[tauri::command]

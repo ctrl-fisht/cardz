@@ -2,7 +2,7 @@ use crate::db;
 use crate::model::*;
 use base64::Engine;
 use fsrs::{FSRS, MemoryState};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -23,6 +23,12 @@ pub struct DeckInfo {
     pub dir: PathBuf,
 }
 
+pub struct GroupInfo {
+    pub id: String,
+    pub name: String,
+    pub dir: PathBuf,
+}
+
 pub struct ParsedNote {
     pub id: String,
     pub note_type: String,
@@ -35,6 +41,7 @@ pub struct ParsedNote {
 struct CardRow {
     card_id: String,
     note_id: String,
+    deck_id: String,
     ord: i64,
     state: i64,
     stability: Option<f64>,
@@ -61,6 +68,7 @@ impl Vault {
 
     pub fn info(&self) -> Result<VaultInfo, String> {
         let decks = discover_decks(&self.root)?;
+        let groups = discover_groups(&self.root, &decks);
         let now = now_ms();
         let day_start = db::day_start_ms();
         let mut out = Vec::with_capacity(decks.len());
@@ -74,6 +82,14 @@ impl Vault {
                 counts,
             });
         }
+        let group_out = groups
+            .into_iter()
+            .map(|group| Group {
+                id: group.id,
+                name: group.name,
+                path: group.dir.to_string_lossy().to_string(),
+            })
+            .collect();
         let name = self
             .root
             .file_name()
@@ -83,6 +99,7 @@ impl Vault {
             root: self.root.to_string_lossy().to_string(),
             name,
             decks: out,
+            groups: group_out,
         })
     }
 
@@ -247,25 +264,63 @@ impl Vault {
     }
 
     pub fn create_deck(&mut self, name: &str, description: &str) -> Result<String, String> {
-        let name = name.trim();
-        if name.is_empty() {
+        let raw = name.trim();
+        if raw.is_empty() {
             return Err("Название колоды не может быть пустым".to_string());
         }
-        let slug = slugify(name);
-        let mut folder = slug.clone();
+        let parts: Vec<&str> = raw
+            .split(['/', '\\'])
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect();
+        let Some(deck_label) = parts.last().copied() else {
+            return Err("Название колоды не может быть пустым".to_string());
+        };
+
+        let mut parent = self.root.clone();
+        let mut parent_ids: Vec<String> = Vec::new();
+        for part in &parts[..parts.len() - 1] {
+            let segment = sanitize_segment(part);
+            parent = parent.join(&segment);
+            parent_ids.push(segment);
+            fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+            if !parent.join("deck.yaml").is_file() && !parent.join("group.yaml").is_file() {
+                let meta = GroupMeta {
+                    id: Some(parent_ids.join("/")),
+                    name: Some(part.trim().to_string()),
+                };
+                fs::write(
+                    parent.join("group.yaml"),
+                    serde_yaml::to_string(&meta).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        let base = sanitize_segment(deck_label);
+        let mut folder = base.clone();
         let mut n = 2;
-        while self.root.join(&folder).exists() {
-            folder = format!("{}-{}", slug, n);
+        while parent.join(&folder).join("deck.yaml").is_file() {
+            folder = format!("{}-{}", base, n);
             n += 1;
         }
-        let dir = self.root.join(&folder);
+
+        let dir = parent.join(&folder);
         fs::create_dir_all(dir.join("notes")).map_err(|e| e.to_string())?;
         fs::create_dir_all(dir.join("media")).map_err(|e| e.to_string())?;
         fs::create_dir_all(dir.join("templates")).map_err(|e| e.to_string())?;
+        let stale_group = dir.join("group.yaml");
+        if stale_group.is_file() {
+            let _ = fs::remove_file(stale_group);
+        }
+
+        let mut ids = parent_ids;
+        ids.push(folder.clone());
+        let deck_id = ids.join("/");
 
         let meta = DeckMeta {
-            id: Some(folder.clone()),
-            name: Some(name.to_string()),
+            id: Some(deck_id.clone()),
+            name: Some(deck_label.to_string()),
             description: Some(description.trim().to_string()),
         };
         fs::write(
@@ -275,6 +330,252 @@ impl Vault {
         .map_err(|e| e.to_string())?;
         fs::write(dir.join("templates").join("basic.yaml"), BASIC_TEMPLATE_YAML)
             .map_err(|e| e.to_string())?;
+        Ok(deck_id)
+    }
+
+    pub fn create_group(&mut self, name: &str) -> Result<String, String> {
+        let raw = name.trim();
+        if raw.is_empty() {
+            return Err("Название группы не может быть пустым".to_string());
+        }
+        let parts: Vec<&str> = raw
+            .split(['/', '\\'])
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err("Название группы не может быть пустым".to_string());
+        }
+
+        let mut dir = self.root.clone();
+        let mut ids: Vec<String> = Vec::new();
+        for part in &parts {
+            let segment = sanitize_segment(part);
+            dir = dir.join(&segment);
+            ids.push(segment);
+            if !dir.exists() {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            } else if dir.join("deck.yaml").is_file() {
+                return Err(format!(
+                    "Папка «{}» уже занята колодой",
+                    ids.join("/")
+                ));
+            }
+            let meta = GroupMeta {
+                id: Some(ids.join("/")),
+                name: Some(part.trim().to_string()),
+            };
+            fs::write(
+                dir.join("group.yaml"),
+                serde_yaml::to_string(&meta).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(ids.join("/"))
+    }
+
+    pub fn delete_group(&mut self, group_id: &str) -> Result<(), String> {
+        let dir = safe_join(&self.root, group_id)?;
+        if !dir.is_dir() {
+            return Err("Папка не найдена".to_string());
+        }
+        if dir == self.root {
+            return Err("Нельзя удалить корень хранилища".to_string());
+        }
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        self.sync()
+    }
+
+    pub fn delete_deck(&mut self, deck_id: &str) -> Result<(), String> {
+        let dir = self.deck_dir(deck_id)?;
+        if !dir.join("deck.yaml").is_file() {
+            return Err("Это папка, а не колода".to_string());
+        }
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        self.sync()
+    }
+
+    pub fn move_deck(&mut self, deck_id: &str, target_group: &str) -> Result<String, String> {
+        let source = self.deck_dir(deck_id)?;
+        let source_rel = safe_relative(deck_id)?;
+        let target_group = target_group.trim();
+        let target_rel = if target_group.is_empty() {
+            PathBuf::new()
+        } else {
+            safe_relative(target_group)?
+        };
+        if target_rel.starts_with(&source_rel) {
+            return Err("Нельзя переместить колоду внутрь себя".to_string());
+        }
+
+        let source_parent = source_rel.parent().unwrap_or(Path::new(""));
+        if source_parent == target_rel.as_path() {
+            return Ok(deck_id.to_string());
+        }
+
+        let target_dir = if target_group.is_empty() {
+            self.root.clone()
+        } else {
+            safe_join(&self.root, target_group)?
+        };
+        if !target_dir.is_dir() {
+            return Err("Группа не найдена".to_string());
+        }
+
+        let folder = source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "Не удалось определить имя папки колоды".to_string())?;
+        let base = sanitize_segment(&folder);
+        let mut destination = target_dir.join(&folder);
+        let mut n = 2;
+        while destination.exists() {
+            destination = target_dir.join(format!("{}-{}", base, n));
+            n += 1;
+        }
+
+        fs::rename(&source, &destination).map_err(|e| e.to_string())?;
+
+        let new_id = destination
+            .strip_prefix(&self.root)
+            .unwrap_or(&destination)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut meta = read_deck_meta(&destination);
+        meta.id = Some(new_id.clone());
+        fs::write(
+            destination.join("deck.yaml"),
+            serde_yaml::to_string(&meta).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        self.sync()?;
+        Ok(new_id)
+    }
+
+    pub fn export_deck(&self, deck_id: &str, dest: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let dir = self.deck_dir(deck_id)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let file = fs::File::create(dest).map_err(|e| e.to_string())?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        for entry in WalkDir::new(&dir).into_iter().filter_map(|item| item.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if file_name.starts_with('.')
+                || file_name == "Thumbs.db"
+                || file_name == "desktop.ini"
+            {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            writer
+                .start_file(rel, options)
+                .map_err(|e| e.to_string())?;
+            let bytes = fs::read(path).map_err(|e| e.to_string())?;
+            writer.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn import_deck(&mut self, source: &Path) -> Result<String, String> {
+        use std::io::Read;
+        if !source.is_file() {
+            return Err("Файл не найден".to_string());
+        }
+        let file = fs::File::open(source).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|_| "Не удалось открыть архив .crdz".to_string())?;
+
+        let meta: DeckMeta = {
+            let mut entry = archive.by_name("deck.yaml").map_err(|_| {
+                "В архиве нет deck.yaml — это не колода Cardz".to_string()
+            })?;
+            let mut text = String::new();
+            entry
+                .read_to_string(&mut text)
+                .map_err(|e| e.to_string())?;
+            serde_yaml::from_str(&text).unwrap_or_default()
+        };
+
+        let fallback = source
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Импортированная колода".to_string());
+        let display_name = meta
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(fallback);
+        let base = sanitize_segment(&display_name);
+        let mut folder = base.clone();
+        let mut n = 2;
+        while self.root.join(&folder).exists() {
+            folder = format!("{}-{}", base, n);
+            n += 1;
+        }
+
+        let target = self.root.join(&folder);
+        fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+
+        let extract = (|| -> Result<(), String> {
+            let mut total: u64 = 0;
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+                let Some(relative) = entry.enclosed_name() else {
+                    continue;
+                };
+                let relative = relative.to_path_buf();
+                let relative_str = relative.to_string_lossy().replace('\\', "/");
+                if relative_str.starts_with("__MACOSX") {
+                    continue;
+                }
+                if entry.is_dir() {
+                    fs::create_dir_all(target.join(&relative)).map_err(|e| e.to_string())?;
+                    continue;
+                }
+                total = total.saturating_add(entry.size());
+                if total > 4 * 1024 * 1024 * 1024 {
+                    return Err("Архив слишком большой".to_string());
+                }
+                let out_path = target.join(&relative);
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut out = fs::File::create(&out_path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = extract {
+            let _ = fs::remove_dir_all(&target);
+            return Err(err);
+        }
+        if !target.join("deck.yaml").is_file() {
+            let _ = fs::remove_dir_all(&target);
+            return Err("Архив не содержит deck.yaml".to_string());
+        }
+        for sub in ["notes", "media", "templates"] {
+            let _ = fs::create_dir_all(target.join(sub));
+        }
+        regenerate_note_ids(&target)?;
+        self.sync()?;
         Ok(folder)
     }
 
@@ -324,31 +625,88 @@ impl Vault {
         ))
     }
 
-    pub fn next_card(&self, deck_id: &str) -> Result<Option<ReviewCard>, String> {
+    pub fn scope_deck_ids(&self, scope: &ReviewScope) -> Result<Vec<String>, String> {
+        let decks = discover_decks(&self.root)?;
+        let ids: Vec<String> = decks.into_iter().map(|deck| deck.id).collect();
+        match scope {
+            ReviewScope::Deck { id } => {
+                if !ids.iter().any(|deck_id| deck_id == id) {
+                    return Err("Колода не найдена".to_string());
+                }
+                Ok(vec![id.clone()])
+            }
+            ReviewScope::Group { id } => {
+                let dir = safe_join(&self.root, id)?;
+                if !dir.is_dir() {
+                    return Err("Папка не найдена".to_string());
+                }
+                let prefix = format!("{}/", id.trim_end_matches('/'));
+                Ok(ids
+                    .into_iter()
+                    .filter(|deck_id| deck_id == id || deck_id.starts_with(&prefix))
+                    .collect())
+            }
+            ReviewScope::All => Ok(ids),
+        }
+    }
+
+    pub fn next_card(
+        &self,
+        scope: &ReviewScope,
+        include_future: bool,
+        exclude: &[String],
+    ) -> Result<Option<ReviewCard>, String> {
+        let deck_ids = self.scope_deck_ids(scope)?;
+        if deck_ids.is_empty() {
+            return Ok(None);
+        }
         let now = now_ms();
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
+        let placeholders = vec!["?"; deck_ids.len()].join(", ");
+        conditions.push(format!("deck_id IN ({})", placeholders));
+        values.extend(deck_ids.into_iter().map(Value::Text));
+
+        if !include_future {
+            conditions.push("(state = 0 OR due IS NULL OR due <= ?)".to_string());
+            values.push(Value::Integer(now));
+        }
+        if !exclude.is_empty() {
+            let placeholders = vec!["?"; exclude.len()].join(", ");
+            conditions.push(format!("card_id NOT IN ({})", placeholders));
+            values.extend(exclude.iter().cloned().map(Value::Text));
+        }
+
+        let order = if include_future {
+            "RANDOM()"
+        } else {
+            "(state = 0) ASC, COALESCE(due, 0) ASC"
+        };
+        let sql = format!(
+            "SELECT card_id, note_id, deck_id, ord, state, stability, difficulty, last_review, due, lapses
+             FROM cards WHERE {} ORDER BY {} LIMIT 1",
+            conditions.join(" AND "),
+            order
+        );
+
         let row = self
             .conn
-            .query_row(
-                "SELECT card_id, note_id, ord, state, stability, difficulty, last_review, due, lapses
-                 FROM cards
-                 WHERE deck_id = ?1 AND (state = 0 OR due IS NULL OR due <= ?2)
-                 ORDER BY (state = 0) ASC, COALESCE(due, 0) ASC
-                 LIMIT 1",
-                params![deck_id, now],
-                |row| {
-                    Ok(CardRow {
-                        card_id: row.get(0)?,
-                        note_id: row.get(1)?,
-                        ord: row.get(2)?,
-                        state: row.get(3)?,
-                        stability: row.get(4)?,
-                        difficulty: row.get(5)?,
-                        last_review: row.get(6)?,
-                        due: row.get(7)?,
-                        lapses: row.get(8)?,
-                    })
-                },
-            )
+            .query_row(&sql, params_from_iter(values.iter()), |row| {
+                Ok(CardRow {
+                    card_id: row.get(0)?,
+                    note_id: row.get(1)?,
+                    deck_id: row.get(2)?,
+                    ord: row.get(3)?,
+                    state: row.get(4)?,
+                    stability: row.get(5)?,
+                    difficulty: row.get(6)?,
+                    last_review: row.get(7)?,
+                    due: row.get(8)?,
+                    lapses: row.get(9)?,
+                })
+            })
             .optional()
             .map_err(|e| e.to_string())?;
 
@@ -368,7 +726,8 @@ impl Vault {
             .ok_or_else(|| "Заметка карточки не найдена".to_string())?;
         let path = safe_join(&self.root, &rel)?;
         let note = parse_note(&path)?;
-        let templates = self.load_templates(deck_id)?;
+        let card_deck_id = card.deck_id.clone();
+        let templates = self.load_templates(&card_deck_id)?;
         let template = templates
             .get(&note.note_type)
             .or_else(|| templates.get(DEFAULT_NOTE_TYPE))
@@ -388,9 +747,9 @@ impl Vault {
         Ok(Some(ReviewCard {
             card_id: card.card_id,
             note_id: card.note_id,
-            deck_id: deck_id.to_string(),
-            deck_name: self.deck_name(deck_id),
-            deck_path: self.deck_dir(deck_id)?.to_string_lossy().to_string(),
+            deck_id: card_deck_id.clone(),
+            deck_name: self.deck_name(&card_deck_id),
+            deck_path: self.deck_dir(&card_deck_id)?.to_string_lossy().to_string(),
             fields: note.fields,
             tags: note.tags,
             card_name: card_template.name,
@@ -408,20 +767,21 @@ impl Vault {
         let card = self
             .conn
             .query_row(
-                "SELECT card_id, note_id, ord, state, stability, difficulty, last_review, due, lapses
+                "SELECT card_id, note_id, deck_id, ord, state, stability, difficulty, last_review, due, lapses
                  FROM cards WHERE card_id = ?1",
                 params![card_id],
                 |row| {
                     Ok(CardRow {
                         card_id: row.get(0)?,
                         note_id: row.get(1)?,
-                        ord: row.get(2)?,
-                        state: row.get(3)?,
-                        stability: row.get(4)?,
-                        difficulty: row.get(5)?,
-                        last_review: row.get(6)?,
-                        due: row.get(7)?,
-                        lapses: row.get(8)?,
+                        deck_id: row.get(2)?,
+                        ord: row.get(3)?,
+                        state: row.get(4)?,
+                        stability: row.get(5)?,
+                        difficulty: row.get(6)?,
+                        last_review: row.get(7)?,
+                        due: row.get(8)?,
+                        lapses: row.get(9)?,
                     })
                 },
             )
@@ -429,14 +789,7 @@ impl Vault {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "Карточка не найдена".to_string())?;
 
-        let deck_id: String = self
-            .conn
-            .query_row(
-                "SELECT deck_id FROM cards WHERE card_id = ?1",
-                params![card.card_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let deck_id = card.deck_id.clone();
 
         let elapsed = elapsed_days(card.last_review, now);
         let memory = memory_state(card.stability, card.difficulty);
@@ -749,7 +1102,7 @@ pub fn discover_decks(root: &Path) -> Result<Vec<DeckInfo>, String> {
 }
 
 fn walk_decks(dir: &Path, root: &Path, depth: usize, out: &mut Vec<DeckInfo>) -> Result<(), String> {
-    if depth > 6 {
+    if depth > 12 {
         return Ok(());
     }
     let entries = match fs::read_dir(dir) {
@@ -770,7 +1123,7 @@ fn walk_decks(dir: &Path, root: &Path, depth: usize, out: &mut Vec<DeckInfo>) ->
         }
         if path.join("deck.yaml").is_file() {
             let meta = read_deck_meta(&path);
-            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let rel = path.strip_prefix(root).unwrap_or(path.as_path());
             let id = rel.to_string_lossy().replace('\\', "/");
             out.push(DeckInfo {
                 id,
@@ -778,15 +1131,131 @@ fn walk_decks(dir: &Path, root: &Path, depth: usize, out: &mut Vec<DeckInfo>) ->
                 description: meta.description.unwrap_or_default(),
                 dir: path.clone(),
             });
-        } else {
-            walk_decks(&path, root, depth + 1, out)?;
+        }
+        walk_decks(&path, root, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+fn discover_groups(root: &Path, decks: &[DeckInfo]) -> Vec<GroupInfo> {
+    let deck_ids: HashSet<String> = decks.iter().map(|deck| deck.id.clone()).collect();
+    let mut map: HashMap<String, String> = HashMap::new();
+
+    for deck in decks {
+        let parts: Vec<&str> = deck.id.split('/').filter(|part| !part.is_empty()).collect();
+        for index in 1..parts.len() {
+            let id = parts[..index].join("/");
+            if !deck_ids.contains(&id) {
+                map.entry(id)
+                    .or_insert_with(|| prettify_label(parts[index - 1]));
+            }
+        }
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if matches!(name.as_str(), "notes" | "media" | "templates") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path.join("deck.yaml").is_file() {
+                stack.push(path);
+                continue;
+            }
+            if path.join("group.yaml").is_file() {
+                let meta = read_group_meta(&path);
+                map.insert(
+                    relative,
+                    meta.name.unwrap_or_else(|| prettify_label(&name)),
+                );
+            }
+            stack.push(path);
+        }
+    }
+
+    let mut out: Vec<GroupInfo> = map
+        .into_iter()
+        .filter(|(id, _)| !deck_ids.contains(id))
+        .map(|(id, name)| GroupInfo {
+            dir: root.join(&id),
+            id,
+            name,
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+fn regenerate_note_ids(root: &Path) -> Result<(), String> {
+    for entry in WalkDir::new(root).into_iter().filter_map(|item| item.ok()) {
+        if !entry.file_type().is_file() || !is_card_file(entry.path()) {
+            continue;
+        }
+        let path = entry.path();
+        let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let new_id = ulid::Ulid::generate().to_string();
+        let (front_matter, body) = split_front_matter(&raw);
+        let mut lines: Vec<String> = front_matter
+            .map(|text| text.lines().map(|line| line.to_string()).collect())
+            .unwrap_or_default();
+        let mut replaced = false;
+        for line in lines.iter_mut() {
+            if line.trim_start().starts_with("id:") {
+                *line = format!("id: {}", new_id);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            lines.insert(0, format!("id: {}", new_id));
+        }
+        let content = format!("---\n{}\n---\n{}", lines.join("\n"), body);
+        let new_path = path
+            .parent()
+            .unwrap_or(root)
+            .join(format!("{}.crd", new_id));
+        fs::write(&new_path, content).map_err(|e| e.to_string())?;
+        if new_path != path {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
 }
 
+fn prettify_label(segment: &str) -> String {
+    let spaced = segment.replace(|ch| ch == '-' || ch == '_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 pub fn read_deck_meta(dir: &Path) -> DeckMeta {
     fs::read_to_string(dir.join("deck.yaml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn read_group_meta(dir: &Path) -> GroupMeta {
+    fs::read_to_string(dir.join("group.yaml"))
         .ok()
         .and_then(|text| serde_yaml::from_str(&text).ok())
         .unwrap_or_default()
@@ -843,7 +1312,7 @@ fn normalize_template(template: &mut Template) {
         template.cards.push(CardTemplate {
             name: "Основная".to_string(),
             front: "{{front}}".to_string(),
-            back: "{{front}}\n\n---\n\n{{back}}".to_string(),
+            back: "{{back}}".to_string(),
         });
     }
 }
@@ -860,7 +1329,7 @@ pub fn builtin_template() -> Template {
         cards: vec![CardTemplate {
             name: "Вопрос → Ответ".to_string(),
             front: "{{front}}".to_string(),
-            back: "{{front}}\n\n---\n\n{{back}}".to_string(),
+            back: "{{back}}".to_string(),
         }],
     }
 }
@@ -1037,7 +1506,7 @@ fn relative_string(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+fn safe_relative(rel: &str) -> Result<PathBuf, String> {
     let rel = rel.trim().replace('\\', "/");
     let path = Path::new(&rel);
     if path.is_absolute() {
@@ -1054,14 +1523,23 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if out.as_os_str().is_empty() {
         return Err("Пустой путь".to_string());
     }
-    Ok(root.join(out))
+    Ok(out)
 }
 
-fn slugify(name: &str) -> String {
+fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    Ok(root.join(safe_relative(rel)?))
+}
+
+fn sanitize_segment(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
-    for ch in name.trim().to_lowercase().chars() {
-        if ch.is_alphanumeric() {
+    for ch in name.trim().chars() {
+        if ch.is_alphanumeric()
+            || matches!(
+                ch,
+                ' ' | '-' | '_' | '#' | '+' | '.' | '(' | ')' | '[' | ']' | '&'
+            )
+        {
             out.push(ch);
             last_dash = false;
         } else if !last_dash {
@@ -1069,13 +1547,21 @@ fn slugify(name: &str) -> String {
             last_dash = true;
         }
     }
-    let out = out.trim_matches('-').to_string();
-    let out: String = out.chars().take(60).collect();
-    if out.is_empty() {
-        "deck".to_string()
-    } else {
-        out
+    let out = out.trim().trim_matches('.').trim();
+    let mut result: String = out.chars().take(64).collect();
+    result = result.trim_end().trim_end_matches('.').to_string();
+    if result.is_empty() {
+        result = "deck".to_string();
     }
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+        "LPT8", "LPT9",
+    ];
+    if RESERVED.iter().any(|reserved| result.eq_ignore_ascii_case(reserved)) {
+        result.push('_');
+    }
+    result
 }
 
 fn mime_for(path: &Path) -> &'static str {
@@ -1156,9 +1642,180 @@ cards:
   - name: Вопрос → Ответ
     front: "{{front}}"
     back: |
-      {{front}}
-
-      ---
-
       {{back}}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("cardz-test-{}-{}", name, stamp));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let root = temp_dir("roundtrip");
+        let mut vault = Vault::open(root.clone()).unwrap();
+        let group = vault.create_group("Программирование/Базы данных").unwrap();
+        assert_eq!(group, "Программирование/Базы данных");
+
+        let deck_id = vault
+            .create_deck("Программирование/Базы данных/C#", "demo")
+            .unwrap();
+        let mut fields = HashMap::new();
+        fields.insert("front".to_string(), "Вопрос".to_string());
+        fields.insert("back".to_string(), "Ответ".to_string());
+        let note = vault
+            .save_note(SaveNoteInput {
+                deck_id: deck_id.clone(),
+                note_id: None,
+                note_type: "basic".to_string(),
+                tags: vec!["тест".to_string()],
+                fields,
+            })
+            .unwrap();
+
+        let info = vault.info().unwrap();
+        assert!(info
+            .groups
+            .iter()
+            .any(|group| group.id == "Программирование/Базы данных"));
+        assert!(info.decks.iter().any(|deck| deck.id == deck_id));
+
+        let archive = root.join("export.crdz");
+        vault.export_deck(&deck_id, &archive).unwrap();
+        assert!(archive.is_file());
+
+        let imported_id = vault.import_deck(&archive).unwrap();
+        assert_ne!(imported_id, deck_id);
+        assert_eq!(vault.list_notes(&deck_id, "").unwrap().len(), 1);
+
+        let imported_notes = vault.list_notes(&imported_id, "").unwrap();
+        assert_eq!(imported_notes.len(), 1);
+        assert_ne!(imported_notes[0].id, note.id);
+        let imported = vault.get_note(&imported_id, &imported_notes[0].id).unwrap();
+        assert_eq!(imported.fields.get("back").map(String::as_str), Some("Ответ"));
+
+        vault.create_group("Перемещения").unwrap();
+        let moved_id = vault.move_deck(&imported_id, "Перемещения").unwrap();
+        assert_eq!(moved_id, "Перемещения/C#");
+        let moved_notes = vault.list_notes(&moved_id, "").unwrap();
+        assert_eq!(moved_notes.len(), 1);
+        assert_eq!(
+            vault
+                .get_note(&moved_id, &moved_notes[0].id)
+                .unwrap()
+                .fields
+                .get("front")
+                .map(String::as_str),
+            Some("Вопрос")
+        );
+
+        let root_id = vault.move_deck(&moved_id, "").unwrap();
+        assert_eq!(root_id, "C#");
+
+        drop(vault);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod review_scope_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("cardz-scope-{}-{}", name, stamp));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn add_note(vault: &mut Vault, deck_id: &str, front: &str) {
+        let mut fields = HashMap::new();
+        fields.insert("front".to_string(), front.to_string());
+        fields.insert("back".to_string(), "ответ".to_string());
+        vault
+            .save_note(SaveNoteInput {
+                deck_id: deck_id.to_string(),
+                note_id: None,
+                note_type: "basic".to_string(),
+                tags: vec![],
+                fields,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn group_scope_and_practice_exclusion() {
+        let root = temp_dir("group");
+        let mut vault = Vault::open(root.clone()).unwrap();
+        vault.create_group("Folder/Nested").unwrap();
+        let deck_a = vault.create_deck("Folder/Nested/A", "").unwrap();
+        let deck_b = vault.create_deck("Folder/B", "").unwrap();
+        let deck_c = vault.create_deck("Outside", "").unwrap();
+        add_note(&mut vault, &deck_a, "A");
+        add_note(&mut vault, &deck_b, "B");
+        add_note(&mut vault, &deck_c, "C");
+
+        let group_scope = ReviewScope::Group {
+            id: "Folder".to_string(),
+        };
+        let mut ids = vault.scope_deck_ids(&group_scope).unwrap();
+        ids.sort();
+        let mut expected = vec![deck_a.clone(), deck_b.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        let mut seen = Vec::new();
+        while let Some(card) = vault.next_card(&group_scope, true, &seen).unwrap() {
+            assert!(card.deck_id.starts_with("Folder/"));
+            seen.push(card.card_id);
+        }
+        assert_eq!(seen.len(), 2);
+
+        let all_scope = ReviewScope::All;
+        let mut seen_all = Vec::new();
+        while let Some(card) = vault.next_card(&all_scope, true, &seen_all).unwrap() {
+            assert!(!seen_all.contains(&card.card_id));
+            seen_all.push(card.card_id);
+        }
+        assert_eq!(seen_all.len(), 3);
+
+        assert!(vault
+            .next_card(&all_scope, false, &[])
+            .unwrap()
+            .is_some());
+
+        vault.delete_deck(&deck_c).unwrap();
+        assert!(!root.join(&deck_c).exists());
+        assert!(!vault
+            .info()
+            .unwrap()
+            .decks
+            .iter()
+            .any(|deck| deck.id == deck_c));
+        assert!(vault.delete_deck("Folder").is_err());
+
+        vault.delete_group("Folder").unwrap();
+        assert!(!root.join("Folder").exists());
+        let info = vault.info().unwrap();
+        assert!(info.decks.is_empty());
+        assert!(vault.info().unwrap().groups.is_empty());
+        assert!(vault.delete_group("Folder").is_err());
+
+        drop(vault);
+        let _ = fs::remove_dir_all(root);
+    }
+}
